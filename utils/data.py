@@ -12,8 +12,8 @@ class ViTFeatureExtractorTransforms:
 
         if feature_extractor.do_resize:
             # if pip install transformers == 4.18.0 does not work
-            # transform.append(Resize([feature_extractor.size['height'], feature_extractor.size['width']]))
-            transform.append(Resize([feature_extractor.size, feature_extractor.size]))
+            transform.append(Resize([feature_extractor.size['height'], feature_extractor.size['width']]))
+            # transform.append(Resize([feature_extractor.size, feature_extractor.size]))
 
         transform.append(ToTensor())
 
