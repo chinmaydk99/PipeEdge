@@ -4,6 +4,8 @@ import argparse
 import time
 import torch
 import numpy as np
+import io
+from contextlib import redirect_stdout
 from typing import List
 from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder, ImageNet
@@ -14,7 +16,7 @@ from utils.data import ViTFeatureExtractorTransforms
 import model_cfg
 from evaluation_tools.evaluation_quant_test import *
 
-class ReportAccuracy():
+class EnhancedReportAccuracy():
     def __init__(self, batch_size, output_dir, model_name, partition, quant) -> None:
         self.current_acc = 0.0
         self.total_acc = 0.0
@@ -25,19 +27,83 @@ class ReportAccuracy():
         self.partition = partition
         self.quant = quant
         self.model_name = model_name.split('/')[1]
-
+        self.pruning_keep_ratio = None  # Will store the pruning keep ratio
+        
+        # Create directory if it doesn't exist
+        self.file_path = os.path.join(self.output_dir, self.model_name)
+        os.makedirs(self.file_path, exist_ok=True)
+        
+        # Initialize files
+        self.acc_file = os.path.join(self.file_path, f"result_{self.partition}_{str(self.quant)}.txt")
+        self.sparsity_file = os.path.join(self.file_path, f"sparsity_{self.partition}_{str(self.quant)}.txt")
+        self.final_file = os.path.join(self.file_path, f"final_{self.partition}_{str(self.quant)}.txt")
+        
+        # Initialize sparsity dict
+        self.sparsity_info = {}
+        
+    def set_pruning_keep_ratio(self, keep_ratio):
+        """Set the pruning keep ratio"""
+        self.pruning_keep_ratio = keep_ratio
+        
     def update(self, pred, target):
         self.correct = pred.eq(target.view(1, -1).expand_as(pred)).float().sum()
         self.current_acc = self.correct / self.batch_size
         self.total_acc = (self.total_acc * self.tested_batch + self.current_acc)/(self.tested_batch+1)
         self.tested_batch += 1
 
-    def report(self,):
+    def report(self):
         print(f"The accuracy so far is: {100*self.total_acc:.2f}")
         file_name = os.path.join(self.output_dir, self.model_name, "result_"+self.partition+"_"+str(self.quant)+".txt")
         os.makedirs(os.path.dirname(file_name), exist_ok=True)
         with open(file_name, 'a') as f:
             f.write(f"{100*self.total_acc:.2f}\n")
+            
+    def capture_sparsity(self, layer_info):
+        """Capture layer density information from console output"""
+        if "Layer:" in layer_info and "Density:" in layer_info:
+            # Parse the layer info string
+            try:
+                # Extract layer name
+                layer_name = layer_info.split("Layer:")[1].split("=>")[0].strip()
+                # Extract density value
+                density = float(layer_info.split("Density:")[1].strip())
+                sparsity = 1.0 - density
+                
+                # Add a counter to make the key unique
+                counter = len(self.sparsity_info) + 1
+                key = f"{counter}_{layer_name}"
+                
+                # Store in dict
+                self.sparsity_info[key] = sparsity
+                
+                # Also write to file immediately
+                with open(self.sparsity_file, 'a') as f:
+                    f.write(f"{counter}_{layer_name}: {sparsity:.6f}\n")
+                    
+            except (ValueError, IndexError) as e:
+                print(f"Error parsing layer info: {e}")
+                
+    def save_final_stats(self):
+        """Save final accuracy and other statistics"""
+        with open(self.final_file, 'w') as f:
+            f.write(f"Model: {self.model_name}\n")
+            f.write(f"Partition: {self.partition}\n")
+            
+            # Include pruning information if available
+            if self.pruning_keep_ratio is not None:
+                f.write(f"Pruning Keep Ratio: {self.pruning_keep_ratio}\n")
+                f.write(f"Pruning Factor: {1.0 - self.pruning_keep_ratio:.6f}\n")
+                
+            f.write(f"Final Accuracy: {100*self.total_acc:.6f}%\n")
+            f.write(f"Total Batches: {self.tested_batch}\n\n")
+            
+            # Write sparsity summary if available
+            if self.sparsity_info:
+                avg_sparsity = sum(self.sparsity_info.values()) / len(self.sparsity_info)
+                f.write(f"Average Sparsity: {avg_sparsity:.6f}\n")
+                f.write("Layer-wise Sparsity:\n")
+                for layer, sparsity in self.sparsity_info.items():
+                    f.write(f"  {layer}: {sparsity:.6f}\n")
 
 def _make_shard(model_name, model_file, stage_layers, stage, q_bits, prune):
     shard = model_cfg.module_shard_factory(model_name, model_file, stage_layers[stage][0],
@@ -86,6 +152,8 @@ def evaluation(args, dataset_cfg):
     prune = args.prune
     train_batch_size = args.train_batch_size
     keep_ratio = args.keep_ratio
+    # if model_file is None:
+    #     model_file = model_cfg.get_model_default_weights_file(model_name)
 
     # load dataset
     if model_name in ['facebook/deit-base-distilled-patch16-224',
@@ -101,6 +169,7 @@ def evaluation(args, dataset_cfg):
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225]),
+        # transforms.Lambda(lambda x: x.unsqueeze(0))
         ])
         val_dataset = ImageFolder(os.path.join(dataset_path, dataset_split),
                                 transform = feature_extractor)
@@ -110,6 +179,7 @@ def evaluation(args, dataset_cfg):
         val_dataset = ImageFolder(os.path.join(dataset_path, dataset_split),
                                 transform = val_transform)
 
+
     val_loader = DataLoader(
         val_dataset,
         batch_size = batch_size,
@@ -118,60 +188,46 @@ def evaluation(args, dataset_cfg):
         pin_memory=True
     )
 
+    # Initialize the accuracy reporter early
+    acc_reporter = EnhancedReportAccuracy(batch_size, output_dir, model_name, partition, quant[0] if quant else 0)
+
     if prune:
-        try:
-            pruned_model_file = model_cfg._MODEL_CONFIGS[model_name]['pruned_weights_file']
-            print(f"Applying magnitude-based pruning with keep_ratio: {keep_ratio}, train_batch_size: {train_batch_size}")
-            
-            # Load training data for evaluation during pruning
-            train_dataset = ImageFolder(os.path.join(dataset_path, 'train'), transform=val_transform)
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=train_batch_size,
-                shuffle=True,
-                pin_memory=True
-            )
-            
-            # Create model for pruning
+        pruned_model_file = model_cfg._MODEL_CONFIGS[model_name]['pruned_weights_file']
+        # dataset_split = 'train'
+        print("keep ratio : ", keep_ratio, ",      train_data size : ", train_batch_size)
+        
+        # Set the pruning keep ratio in the accuracy reporter
+        acc_reporter.set_pruning_keep_ratio(keep_ratio)
+        
+        train_dataset = ImageFolder(os.path.join(dataset_path, 'train'), transform = val_transform)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size = train_batch_size,
+            shuffle=True,
+            pin_memory=True
+        )
+        for ubatch, ubatch_labels in train_loader:
             config = model_cfg.get_model_config(model_name)
-            shard_config = model_cfg.ModuleShardConfig(
-                layer_start=1, 
-                layer_end=model_cfg.get_model_layers(model_name),
-                is_first=True, 
-                is_last=True
-            )
+            shard_config = model_cfg.ModuleShardConfig(layer_start=1, layer_end=model_cfg.get_model_layers(model_name),
+                                            is_first=True, is_last=True)
             model_file = model_cfg.get_model_default_weights_file(model_name)
+            
             model = model_cfg._MODEL_CONFIGS[model_name]['shard_module'](config, shard_config, model_file)
             
-            # Get a batch for evaluation
-            for ubatch, ubatch_labels in train_loader:
-                # Apply magnitude-based pruning
-                weights = model.prune_magnitude(ubatch, ubatch_labels, keep_ratio)
-                
-                # Calculate model sparsity after pruning
-                total_params = 0
-                zero_params = 0
-                for key, param in weights.items():
-                    if 'weight' in key and 'patch_embeddings' not in key:
-                        tensor = param.cpu().numpy()
-                        total_params += tensor.size
-                        zero_params += np.sum(tensor == 0)
-                
-                if total_params > 0:
-                    sparsity = zero_params / total_params
-                    print(f"Model sparsity after pruning: {sparsity:.4f} ({zero_params}/{total_params} parameters pruned)")
-                
-                # Save pruned weights
-                np.savez(pruned_model_file, **weights)
-                print(f'Pruning completed successfully. Weights saved to {pruned_model_file}')
-                model_file = pruned_model_file
-                break
-                
-        except Exception as e:
-            print(f"ERROR during pruning: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            print("Continuing with unpruned model...")
+            # Capture the density outputs during pruning
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                weights = model.prune_magnitude(keep_ratio)
+            
+            # Process captured output
+            for line in output_buffer.getvalue().split('\n'):
+                if "Layer:" in line and "Density:" in line:
+                    acc_reporter.capture_sparsity(line)
+
+            np.savez(pruned_model_file, **weights)
+            print('Pruning successfully.')
+            model_file = pruned_model_file
+            break
 
     def _get_default_quant(n_stages: int) -> List[int]:
         return [0] * n_stages
@@ -191,7 +247,6 @@ def evaluation(args, dataset_cfg):
 
     # run inference
     start_time = time.time()
-    acc_reporter = ReportAccuracy(batch_size, output_dir, model_name, partition, stage_quant[0])
     with torch.no_grad():
         for batch_idx, (input, target) in enumerate(val_loader):
             if batch_idx == num_stop_batch and num_stop_batch:
@@ -201,9 +256,12 @@ def evaluation(args, dataset_cfg):
             pred = pred.t()
             acc_reporter.update(pred, target)
             acc_reporter.report()
-    print(f"Final Accuracy: {100*acc_reporter.total_acc:.2f}%; Quant Bitwidth: {stage_quant}")
+    print(f"Final Accuracy: {100*acc_reporter.total_acc}; Quant Bitwidth: {stage_quant}")
     end_time = time.time()
-    print(f"total time = {end_time - start_time:.2f} seconds")
+    print(f"total time = {end_time - start_time}")
+    
+    # Save final statistics
+    acc_reporter.save_final_stats()
 
 
 if __name__ == "__main__":
@@ -250,9 +308,9 @@ if __name__ == "__main__":
     dset.add_argument("--dataset-shuffle", type=bool, nargs='?', const=True, default=False,
                       help="dataset shuffle")
     dset.add_argument("--prune", type=bool, nargs='?', const=True, default=False,
-                      help="Apply magnitude-based pruning")
+                      help="Pruning method")
     dset.add_argument("--keep-ratio", type=float, default=0.9,
-                      help="Pruning keep ratio (higher means less pruning)")
+                      help="Snip_pruning keep ratio")
     args = parser.parse_args()
 
 

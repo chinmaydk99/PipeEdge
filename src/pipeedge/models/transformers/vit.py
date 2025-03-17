@@ -15,7 +15,11 @@ from transformers.models.vit.modeling_vit import (
 from .. import ModuleShard, ModuleShardConfig
 from . import TransformerShardData
 import torch.nn.functional as F
+import types
 import copy
+
+import pdb
+
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +29,10 @@ _WEIGHTS_URLS = {
     'google/vit-huge-patch14-224-in21k': 'https://storage.googleapis.com/vit_models/imagenet21k/ViT-H_14.npz',
 }
 
+
 class ViTLayerShard(ModuleShard):
     """Module shard based on `ViTLayer`."""
+
     def __init__(self, config: ViTConfig, shard_config: ModuleShardConfig):
         super().__init__(config, shard_config)
         self.layernorm_before = None
@@ -51,8 +57,10 @@ class ViTLayerShard(ModuleShard):
         if self.has_layer(3):
             self.output = ViTOutput(self.config)
 
+    
     def forward(self, data: TransformerShardData) -> TransformerShardData:
         """Compute layer shard."""
+        # pdb.set_trace()
         if self.has_layer(0):
             data_norm = self.layernorm_before(data)
             data = (self.self_attention(data_norm)[0], data)
@@ -69,10 +77,13 @@ class ViTLayerShard(ModuleShard):
 
 class ViTModelShard(ModuleShard):
     """Module shard based on `ViTModel` (no pooling layer)."""
+
     def __init__(self, config: ViTConfig, shard_config: ModuleShardConfig,
                  model_weights: Union[str, Mapping], prune=False):
         super().__init__(config, shard_config)
         self.embeddings = None
+        # ViTModel uses an encoder here, but we'll just add the layers here instead.
+        # Since we just do inference, a ViTEncoderShard class wouldn't provide real benefit.
         self.layers = nn.ModuleList()
         self.layernorm = None
         logger.debug(">>>> Model name: %s", self.config.name_or_path)
@@ -112,22 +123,23 @@ class ViTModelShard(ModuleShard):
 
     @torch.no_grad()
     def _load_weights_first(self, weights, prune=False):
-        if prune:
-            self.embeddings.cls_token.copy_(torch.from_numpy(weights["vit.embeddings.cls_token"]))
-            self.embeddings.position_embeddings.copy_(torch.from_numpy(weights["vit.embeddings.position_embeddings"]))
-            self.embeddings.patch_embeddings.projection.weight.copy_(torch.from_numpy(weights["vit.embeddings.patch_embeddings.projection.weight"]))
-            self.embeddings.patch_embeddings.projection.bias.copy_(torch.from_numpy(weights["vit.embeddings.patch_embeddings.projection.bias"]))
-        else:
-            self.embeddings.cls_token.copy_(torch.from_numpy(weights["cls"]))
-            self.embeddings.position_embeddings.copy_(torch.from_numpy((weights["Transformer/posembed_input/pos_embedding"])))
-            conv_weight = weights["embedding/kernel"]
-            conv_weight = conv_weight.transpose([3, 2, 0, 1])
-            self.embeddings.patch_embeddings.projection.weight.copy_(torch.from_numpy(conv_weight))
-            self.embeddings.patch_embeddings.projection.bias.copy_(torch.from_numpy(weights["embedding/bias"]))
-
+            if(prune):
+                self.embeddings.cls_token.copy_(torch.from_numpy(weights["vit.embeddings.cls_token"]))
+                self.embeddings.position_embeddings.copy_(torch.from_numpy(weights["vit.embeddings.position_embeddings"]))
+                self.embeddings.patch_embeddings.projection.weight.copy_(torch.from_numpy(weights["vit.embeddings.patch_embeddings.projection.weight"]))
+                self.embeddings.patch_embeddings.projection.bias.copy_(torch.from_numpy(weights["vit.embeddings.patch_embeddings.projection.bias"]))
+            else:
+                self.embeddings.cls_token.copy_(torch.from_numpy(weights["cls"]))
+                self.embeddings.position_embeddings.copy_(torch.from_numpy((weights["Transformer/posembed_input/pos_embedding"])))
+                conv_weight = weights["embedding/kernel"]
+                # O, I, J, K = conv_weight.shape
+                # conv_weight = conv_weight.reshape(K,J,O,I)
+                conv_weight = conv_weight.transpose([3, 2, 0, 1])
+                self.embeddings.patch_embeddings.projection.weight.copy_(torch.from_numpy(conv_weight))
+                self.embeddings.patch_embeddings.projection.bias.copy_(torch.from_numpy(weights["embedding/bias"]))
     @torch.no_grad()
     def _load_weights_last(self, weights, prune=False):
-        if prune:
+        if(prune):
             self.layernorm.weight.copy_(torch.from_numpy(weights["vit.layernorm.weight"]))
             self.layernorm.bias.copy_(torch.from_numpy(weights["vit.layernorm.bias"]))
         else:
@@ -139,7 +151,7 @@ class ViTModelShard(ModuleShard):
         root = f"Transformer/encoderblock_{layer_id}/"
         hidden_size = self.config.hidden_size
         if layer.has_layer(0):
-            if prune:
+            if(prune):
                 layer.layernorm_before.weight.copy_(torch.from_numpy(weights["vit.layers.{}.layernorm_before.weight".format(layer_id)]))
                 layer.layernorm_before.bias.copy_(torch.from_numpy(weights["vit.layers.{}.layernorm_before.bias".format(layer_id)]))
                 layer.self_attention.query.weight.copy_(torch.from_numpy(weights["vit.layers.{}.self_attention.query.weight".format(layer_id)]))
@@ -158,14 +170,14 @@ class ViTModelShard(ModuleShard):
                 layer.self_attention.key.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/key/bias"]).view(-1))
                 layer.self_attention.value.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/value/bias"]).view(-1))
         if layer.has_layer(1):
-            if prune:
+            if(prune):
                 layer.self_output.dense.weight.copy_(torch.from_numpy(weights["vit.layers.{}.self_output.dense.weight".format(layer_id)]))
                 layer.self_output.dense.bias.copy_(torch.from_numpy(weights["vit.layers.{}.self_output.dense.bias".format(layer_id)]))
             else:
                 layer.self_output.dense.weight.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/out/kernel"]).view(hidden_size, hidden_size).t())
                 layer.self_output.dense.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/out/bias"]).view(-1))
         if layer.has_layer(2):
-            if prune:
+            if(prune):
                 layer.layernorm_after.weight.copy_(torch.from_numpy(weights["vit.layers.{}.layernorm_after.weight".format(layer_id)]))
                 layer.layernorm_after.bias.copy_(torch.from_numpy(weights["vit.layers.{}.layernorm_after.bias".format(layer_id)]))
                 layer.intermediate.dense.weight.copy_(torch.from_numpy(weights["vit.layers.{}.intermediate.dense.weight".format(layer_id)]))
@@ -176,14 +188,15 @@ class ViTModelShard(ModuleShard):
                 layer.intermediate.dense.weight.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_0/kernel"]).t())
                 layer.intermediate.dense.bias.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_0/bias"]).t())
         if layer.has_layer(3):
-            if prune:
+            if(prune):
                 layer.output.dense.weight.copy_(torch.from_numpy(weights["vit.layers.{}.output.dense.weight".format(layer_id)]))
-                layer.output.dense.bias.copy_(torch.from_numpy(weights["vit.layers.{}.output.dense.bias".format(layer_id)]))
+                layer.output.dense.bias.copy_(torch.from_numpy(weights["vit.layers.{}.output.dense.bias".format(layer_id)]))                
             else:
                 layer.output.dense.weight.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_1/kernel"]).t())
                 layer.output.dense.bias.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_1/bias"]).t())
 
     def forward(self, data: TransformerShardData) -> TransformerShardData:
+        # pdb.set_trace()
         """Compute shard layers."""
         if self.shard_config.is_first:
             data = self.embeddings(data)
@@ -208,6 +221,7 @@ class ViTModelShard(ModuleShard):
                     file.write(chunk)
                     file.flush()
                     os.fsync(file.fileno())
+
 
 
 class ViTShardForImageClassification(ModuleShard):
@@ -246,6 +260,7 @@ class ViTShardForImageClassification(ModuleShard):
 
     def forward(self, data: TransformerShardData) -> TransformerShardData:
         """Compute shard layers."""
+        # pdb.set_trace()
         data = self.vit(data)
         if self.shard_config.is_last:
             data = self.classifier(data[:, 0, :])
@@ -257,82 +272,67 @@ class ViTShardForImageClassification(ModuleShard):
         """Save the model weights file."""
         ViTModelShard.save_weights(model_name, model_file, url=url, timeout_sec=timeout_sec)
 
-    def prune_magnitude(self, ubatch, ubatch_labels, keep_ratio=0.9):
+    # Magnitude Based Pruning
+    def prune_magnitude(self, keep_ratio=0.9):
         """
-        Magnitude-based pruning for ViT.
+        Prune ViT model using magnitude-based pruning.
         
         Args:
-            ubatch: Input batch (not used but kept for API compatibility)
-            ubatch_labels: Labels for batch (not used but kept for API compatibility)
-            keep_ratio: Percentage of weights to keep (0.9 = 90%)
-            
-        Returns:
-            Pruned model weights
-        """
-        print(f"Starting magnitude-based pruning with keep_ratio: {keep_ratio}")
+            keep_ratio: Percentage of weights to keep (0-1)
         
-        # Create a copy for pruning
+        Returns:
+            Dictionary of pruned weights compatible with the pipeline
+        """
+        # Create a copy of the model to work with
         net = copy.deepcopy(self)
         
-        # Collect all linear layers for pruning (excluding patch embeddings)
-        linear_layers = []
-        for name, module in net.named_modules():
-            if isinstance(module, nn.Linear) and "patch_embeddings" not in name:
-                linear_layers.append((name, module))
+        # Calculate prune percentage from keep ratio
+        prune_percent = 100 * (1 - keep_ratio)
         
-        # Get all weights from linear layers
+        # Collect all prunable layers (Linear layers only)
+        prunable_layers = []
+        for layer in net.modules():
+            if isinstance(layer, nn.Linear):
+                prunable_layers.append(layer)
+        
+        # Create masks initialized to all ones
+        masks = []
+        for layer in prunable_layers:
+            mask = torch.ones_like(layer.weight.data)
+            masks.append(mask)
+        
+        # Collect all weights for global threshold calculation
         all_weights = []
-        for _, layer in linear_layers:
-            all_weights.append(torch.abs(layer.weight.data).flatten())
+        for layer in prunable_layers:
+            all_weights.append(layer.weight.data.abs().flatten())
         
-        if not all_weights:
-            print("No prunable layers found!")
-            return self.state_dict()
-            
-        all_weights_concat = torch.cat(all_weights)
+        # Calculate global threshold based on percentile
+        all_weights = torch.cat(all_weights)
+        threshold = torch.kthvalue(all_weights, 
+                                int(all_weights.numel() * prune_percent / 100)).values
         
-        # Calculate threshold based on keep_ratio
-        threshold_idx = int(all_weights_concat.numel() * (1 - keep_ratio))
-        threshold_value = all_weights_concat.kthvalue(threshold_idx).values.item()
-        
-        print(f"Pruning threshold calculated: {threshold_value}")
-        
-        # Create and apply masks
-        for layer_idx, (name, layer) in enumerate(linear_layers):
-            # Determine if this is first or last layer (don't prune)
-            is_first_layer = layer_idx == 0
-            is_last_layer = layer_idx == len(linear_layers) - 1
-            
-            if is_first_layer or is_last_layer:
-                # Don't prune first and last layers
-                density = 1.0
-                print(f"Skipping pruning for {name} (first/last layer)")
-            else:
-                # Create mask based on magnitude
-                mask = (torch.abs(layer.weight.data) >= threshold_value).float()
-                density = torch.sum(mask) / mask.numel()
+        # Apply masks based on the threshold and update weights
+        # Skip first and last layer as they're preserved (like in SNIP)
+        for i, (layer, mask) in enumerate(zip(prunable_layers, masks)):
+            if i == 0 or i == len(prunable_layers) - 1:
+                continue
                 
-                # Set weights below threshold to zero
-                layer.weight.data = layer.weight.data * mask
-                
-            print(f"Layer {name} => Density: {density:.4f}")
+            # Create mask based on magnitude
+            binary_mask = (layer.weight.data.abs() >= threshold).float()
+            masks[i] = binary_mask
+            
+            # Apply mask to weights
+            layer.weight.data = layer.weight.data * binary_mask
+            
+            # Print statistics
+            density = binary_mask.sum().item() / binary_mask.numel()
+            print(f"Layer:{layer} => Density: {density:.4f}")
         
-        # Calculate overall model sparsity
-        total_params = 0
-        zero_params = 0
-        for _, layer in linear_layers:
-            if layer_idx > 0 and layer_idx < len(linear_layers) - 1:  # Skip first and last layers
-                tensor = layer.weight.data.cpu().numpy()
-                total_params += tensor.size
-                zero_params += np.sum(tensor == 0)
-        
-        overall_sparsity = zero_params / total_params if total_params > 0 else 0
-        print(f"Overall model sparsity: {overall_sparsity:.4f} ({zero_params}/{total_params} parameters are zero)")
-        
-        # Return the pruned state dict
+        # Convert state dict to the format expected by the pipeline
         state_dict = net.state_dict()
         weights = {}
         for key, val in state_dict.items():
             weights[key] = val
         
         return weights
+
