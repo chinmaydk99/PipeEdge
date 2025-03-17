@@ -15,6 +15,11 @@ from transformers.models.vit.modeling_vit import (
 from .. import ModuleShard, ModuleShardConfig
 from . import TransformerShardData
 import torch.nn.functional as F
+import types
+import copy
+
+import pdb
+
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +29,10 @@ _WEIGHTS_URLS = {
     'google/vit-huge-patch14-224-in21k': 'https://storage.googleapis.com/vit_models/imagenet21k/ViT-H_14.npz',
 }
 
+
 class ViTLayerShard(ModuleShard):
     """Module shard based on `ViTLayer`."""
+
     def __init__(self, config: ViTConfig, shard_config: ModuleShardConfig):
         super().__init__(config, shard_config)
         self.layernorm_before = None
@@ -50,8 +57,10 @@ class ViTLayerShard(ModuleShard):
         if self.has_layer(3):
             self.output = ViTOutput(self.config)
 
+    
     def forward(self, data: TransformerShardData) -> TransformerShardData:
         """Compute layer shard."""
+        # pdb.set_trace()
         if self.has_layer(0):
             data_norm = self.layernorm_before(data)
             data = (self.self_attention(data_norm)[0], data)
@@ -66,12 +75,16 @@ class ViTLayerShard(ModuleShard):
             data = self.output(data[0], data[1])
         return data
 
+
 class ViTModelShard(ModuleShard):
     """Module shard based on `ViTModel` (no pooling layer)."""
+
     def __init__(self, config: ViTConfig, shard_config: ModuleShardConfig,
                  model_weights: Union[str, Mapping], prune=False):
         super().__init__(config, shard_config)
         self.embeddings = None
+        # ViTModel uses an encoder here, but we'll just add the layers here instead.
+        # Since we just do inference, a ViTEncoderShard class wouldn't provide real benefit.
         self.layers = nn.ModuleList()
         self.layernorm = None
         logger.debug(">>>> Model name: %s", self.config.name_or_path)
@@ -111,22 +124,23 @@ class ViTModelShard(ModuleShard):
 
     @torch.no_grad()
     def _load_weights_first(self, weights, prune=False):
-        if prune:
-            self.embeddings.cls_token.copy_(torch.from_numpy(weights["vit.embeddings.cls_token"]))
-            self.embeddings.position_embeddings.copy_(torch.from_numpy(weights["vit.embeddings.position_embeddings"]))
-            self.embeddings.patch_embeddings.projection.weight.copy_(torch.from_numpy(weights["vit.embeddings.patch_embeddings.projection.weight"]))
-            self.embeddings.patch_embeddings.projection.bias.copy_(torch.from_numpy(weights["vit.embeddings.patch_embeddings.projection.bias"]))
-        else:
-            self.embeddings.cls_token.copy_(torch.from_numpy(weights["cls"]))
-            self.embeddings.position_embeddings.copy_(torch.from_numpy((weights["Transformer/posembed_input/pos_embedding"])))
-            conv_weight = weights["embedding/kernel"]
-            conv_weight = conv_weight.transpose([3, 2, 0, 1])
-            self.embeddings.patch_embeddings.projection.weight.copy_(torch.from_numpy(conv_weight))
-            self.embeddings.patch_embeddings.projection.bias.copy_(torch.from_numpy(weights["embedding/bias"]))
-
+            if(prune):
+                self.embeddings.cls_token.copy_(torch.from_numpy(weights["vit.embeddings.cls_token"]))
+                self.embeddings.position_embeddings.copy_(torch.from_numpy(weights["vit.embeddings.position_embeddings"]))
+                self.embeddings.patch_embeddings.projection.weight.copy_(torch.from_numpy(weights["vit.embeddings.patch_embeddings.projection.weight"]))
+                self.embeddings.patch_embeddings.projection.bias.copy_(torch.from_numpy(weights["vit.embeddings.patch_embeddings.projection.bias"]))
+            else:
+                self.embeddings.cls_token.copy_(torch.from_numpy(weights["cls"]))
+                self.embeddings.position_embeddings.copy_(torch.from_numpy((weights["Transformer/posembed_input/pos_embedding"])))
+                conv_weight = weights["embedding/kernel"]
+                # O, I, J, K = conv_weight.shape
+                # conv_weight = conv_weight.reshape(K,J,O,I)
+                conv_weight = conv_weight.transpose([3, 2, 0, 1])
+                self.embeddings.patch_embeddings.projection.weight.copy_(torch.from_numpy(conv_weight))
+                self.embeddings.patch_embeddings.projection.bias.copy_(torch.from_numpy(weights["embedding/bias"]))
     @torch.no_grad()
     def _load_weights_last(self, weights, prune=False):
-        if prune:
+        if(prune):
             self.layernorm.weight.copy_(torch.from_numpy(weights["vit.layernorm.weight"]))
             self.layernorm.bias.copy_(torch.from_numpy(weights["vit.layernorm.bias"]))
         else:
@@ -138,7 +152,7 @@ class ViTModelShard(ModuleShard):
         root = f"Transformer/encoderblock_{layer_id}/"
         hidden_size = self.config.hidden_size
         if layer.has_layer(0):
-            if prune:
+            if(prune):
                 layer.layernorm_before.weight.copy_(torch.from_numpy(weights["vit.layers.{}.layernorm_before.weight".format(layer_id)]))
                 layer.layernorm_before.bias.copy_(torch.from_numpy(weights["vit.layers.{}.layernorm_before.bias".format(layer_id)]))
                 layer.self_attention.query.weight.copy_(torch.from_numpy(weights["vit.layers.{}.self_attention.query.weight".format(layer_id)]))
@@ -157,14 +171,14 @@ class ViTModelShard(ModuleShard):
                 layer.self_attention.key.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/key/bias"]).view(-1))
                 layer.self_attention.value.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/value/bias"]).view(-1))
         if layer.has_layer(1):
-            if prune:
+            if(prune):
                 layer.self_output.dense.weight.copy_(torch.from_numpy(weights["vit.layers.{}.self_output.dense.weight".format(layer_id)]))
                 layer.self_output.dense.bias.copy_(torch.from_numpy(weights["vit.layers.{}.self_output.dense.bias".format(layer_id)]))
             else:
                 layer.self_output.dense.weight.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/out/kernel"]).view(hidden_size, hidden_size).t())
                 layer.self_output.dense.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/out/bias"]).view(-1))
         if layer.has_layer(2):
-            if prune:
+            if(prune):
                 layer.layernorm_after.weight.copy_(torch.from_numpy(weights["vit.layers.{}.layernorm_after.weight".format(layer_id)]))
                 layer.layernorm_after.bias.copy_(torch.from_numpy(weights["vit.layers.{}.layernorm_after.bias".format(layer_id)]))
                 layer.intermediate.dense.weight.copy_(torch.from_numpy(weights["vit.layers.{}.intermediate.dense.weight".format(layer_id)]))
@@ -175,14 +189,15 @@ class ViTModelShard(ModuleShard):
                 layer.intermediate.dense.weight.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_0/kernel"]).t())
                 layer.intermediate.dense.bias.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_0/bias"]).t())
         if layer.has_layer(3):
-            if prune:
+            if(prune):
                 layer.output.dense.weight.copy_(torch.from_numpy(weights["vit.layers.{}.output.dense.weight".format(layer_id)]))
-                layer.output.dense.bias.copy_(torch.from_numpy(weights["vit.layers.{}.output.dense.bias".format(layer_id)]))
+                layer.output.dense.bias.copy_(torch.from_numpy(weights["vit.layers.{}.output.dense.bias".format(layer_id)]))                
             else:
                 layer.output.dense.weight.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_1/kernel"]).t())
                 layer.output.dense.bias.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_1/bias"]).t())
 
     def forward(self, data: TransformerShardData) -> TransformerShardData:
+        # pdb.set_trace()
         """Compute shard layers."""
         if self.shard_config.is_first:
             data = self.embeddings(data)
@@ -208,16 +223,16 @@ class ViTModelShard(ModuleShard):
                     file.flush()
                     os.fsync(file.fileno())
 
+
+
 class ViTShardForImageClassification(ModuleShard):
-    """Module shard based on `ViTForImageClassification` with magnitude-based pruning."""
+    """Module shard based on `ViTForImageClassification`."""
     def __init__(self, config: ViTConfig, shard_config: ModuleShardConfig,
                  model_weights: Union[str, Mapping], prune=False):
         super().__init__(config, shard_config)
         self.vit = None
         self.classifier = None
-        self.initial_weights = None  # Store initial weights for Lottery Ticket reset
-        self.masks = {}  # Persistent masks for pruning
-        
+            
         logger.debug(">>>> Model name: %s", self.config.name_or_path)
         if isinstance(model_weights, str):
             logger.debug(">>>> Load weight file: %s", model_weights)
@@ -225,16 +240,11 @@ class ViTShardForImageClassification(ModuleShard):
                 self._build_shard(weights, prune)
         else:
             self._build_shard(model_weights, prune)
-        
-        # Initialize pruning infrastructure after building
-        self.initial_weights = self.state_dict()  # Capture initial weights post-load
-        for name, param in self.named_parameters():
-            if 'weight' in name and 'patch_embeddings' not in name:  # Exclude patch embeddings
-                self.masks[name] = torch.ones_like(param.data)
 
     def _build_shard(self, weights, prune=False):
-        """Build the shard with ViT model and classifier."""
+        ## all shards use the inner ViT model
         self.vit = ViTModelShard(self.config, self.shard_config, weights, prune)
+
         if self.shard_config.is_last:
             logger.debug(">>>> Load classifier for the last shard")
             self.classifier = nn.Linear(self.config.hidden_size, self.config.num_labels) if self.config.num_labels > 0 else nn.Identity()
@@ -242,8 +252,7 @@ class ViTShardForImageClassification(ModuleShard):
 
     @torch.no_grad()
     def _load_weights_last(self, weights, prune=False):
-        """Load classifier weights."""
-        if prune:
+        if(prune):
             self.classifier.weight.copy_(torch.from_numpy(weights['classifier.weight']))
             self.classifier.bias.copy_(torch.from_numpy(weights['classifier.bias']))
         else:
@@ -251,10 +260,8 @@ class ViTShardForImageClassification(ModuleShard):
             self.classifier.bias.copy_(torch.from_numpy(weights["head/bias"]))
 
     def forward(self, data: TransformerShardData) -> TransformerShardData:
-        """Compute shard layers, applying masks to enforce pruning."""
-        for name, param in self.named_parameters():
-            if 'weight' in name and name in self.masks:
-                param.data = param.data * self.masks[name]
+        """Compute shard layers."""
+        # pdb.set_trace()
         data = self.vit(data)
         if self.shard_config.is_last:
             data = self.classifier(data[:, 0, :])
@@ -266,52 +273,87 @@ class ViTShardForImageClassification(ModuleShard):
         """Save the model weights file."""
         ViTModelShard.save_weights(model_name, model_file, url=url, timeout_sec=timeout_sec)
 
-    def prune_magnitude(self, ubatch, ubatch_labels, keep_ratio=0.9, acc_threshold=0.2):
-        """Prune the model based on weight magnitude, inspired by LotteryFL."""
-        # Evaluating  current accuracy
-        self.eval()
-        with torch.no_grad():
-            outputs = self.forward(ubatch)
-            loss = F.nll_loss(outputs, ubatch_labels)
-            _, preds = torch.max(outputs, 1)
-            accuracy = torch.sum(preds == ubatch_labels).item() / len(ubatch_labels)
+    #SNIP Algorithm on Vit model
+    def prune_snip(self, ubatch, ubatch_labels, keep_ratio = 0.9):
+        # import ipdb; ipdb.set_trace()
+        net = copy.deepcopy(self)
 
-        # Skip pruning if accuracy is below threshold
-        if accuracy < acc_threshold:
-            logger.debug(f"Accuracy {accuracy:.4f} below threshold {acc_threshold}, skipping pruning")
-            return self.state_dict()
+        # Monkey-patch the Linear and Conv2d layer to learn the multiplicative mask
+        # instead of the weights
+        layer_idx = 0
+        for layer in net.modules():
+            # we don't prune the patch embeddings in ViT, so no Conv2d
+            # if isinstance(layer, nn.Conv2d) or isinstance(layer, nn.Linear):
+            if isinstance(layer, nn.Linear):
+                layer.weight_mask = nn.Parameter(torch.ones_like(layer.weight))
+                # nn.init.xavier_normal_(layer.weight) 
+                # nn.init.normal_(layer.weight, mean=0.0, std=0.02)
+                layer.weight.requires_grad = False
+            # Override the forward methods:
+            # if isinstance(layer, nn.Conv2d):
+            #     layer.forward = types.MethodType(snip_forward_conv2d, layer)
+        
+            if isinstance(layer, nn.Linear):
+                layer.forward = types.MethodType(snip_forward_linear, layer)
+            
 
-        # Compute magnitude-based pruning for Linear layers only (like in snip excluding patch embeddings)
-        magnitudes = []
-        for name, param in self.named_parameters():
-            if 'weight' in name and name in self.masks:  # Only prunable layers (Linear)
-                magnitudes.append(torch.abs(param.data).flatten())
+        # forward and backward
+        # Compute gradients (but don't apply them)
+        net.zero_grad()
+        outputs = net.forward(ubatch)
+        loss = F.nll_loss(outputs, ubatch_labels)
+        loss.backward()
+        # snip_keep_masks according to layers
 
-        if not magnitudes:
-            logger.debug("No prunable layers found in this shard")
-            return self.state_dict()
+        grads_abs = []
+        for layer in net.modules():
+            if isinstance(layer, nn.Linear):
+            # if isinstance(layer, nn.Conv2d) or isinstance(layer, nn.Linear):
+                grads_abs.append(torch.abs(layer.weight_mask.grad))
 
-        all_magnitudes = torch.cat(magnitudes)
-        num_params_to_keep = int(len(all_magnitudes) * keep_ratio)
-        threshold, _ = torch.topk(all_magnitudes, num_params_to_keep, sorted=True)
-        acceptable_magnitude = threshold[-1]
+        all_scores = torch.cat([torch.flatten(x) for x in grads_abs])
+        norm_factor = torch.sum(all_scores)
+        all_scores.div_(norm_factor)
+    
+        num_params_to_keep = int(len(all_scores) * keep_ratio)
+        threshold, _ = torch.topk(all_scores, num_params_to_keep, sorted=True)
+        acceptable_score = threshold[-1]
+    
+        keep_masks = []
+        for g in grads_abs:
+            keep_masks.append(((g / norm_factor) >= acceptable_score).float())
+    
+        # print(torch.sum(torch.cat([torch.flatten(x == 1) for x in keep_masks])))
 
-        # Step 4: Update masks and reset weights
-        for name, param in self.named_parameters():
-            if 'weight' in name and name in self.masks:  # Prunable Linear layers
-                mask = (torch.abs(param.data) >= acceptable_magnitude).float()
-                self.masks[name] = mask
-                param.data = self.initial_weights[name] * mask
-            elif 'weight' in name and 'patch_embeddings' in name:  # Protect patch embeddings
-                self.masks[name] = torch.ones_like(param.data)
-                param.data = self.initial_weights[name]
 
-        # Step 5: Log sparsity
-        for name, mask in self.masks.items():
-            density = torch.sum(mask) / mask.numel()
-            logger.debug(f"Layer {name} => Density: {density:.4f}")
+        prunable_layers = filter(
+            lambda layer: isinstance(layer, nn.Linear), self.modules())
+            # lambda layer: isinstance(layer, nn.Conv2d) or isinstance(layer, nn.Linear), self.modules())
 
-        # Step 6: Return pruned weights
+        # remove the mask for the first and last layer
+        keep_masks[0] = torch.ones_like(keep_masks[0])
+        keep_masks[-1] = torch.ones_like(keep_masks[-1])
+        for layer, keep_mask in zip(prunable_layers, keep_masks):
+            assert (layer.weight.shape == keep_mask.shape)
+
+            print(f"Layer:{str(layer)} => Density: {torch.sum(keep_mask)/torch.numel(keep_mask)}")
+
+            # mask[i] == 0 --> Prune parameter
+            # mask[i] == 1 --> Keep parameter
+    
+            # Step 1: Set the masked weights to zero (NB the biases are ignored)
+            # Step 2: Make sure their gradients remain zero
+            layer.weight.data[keep_mask == 0.] = 0.
         state_dict = self.state_dict()
-        weights = {key: val for key, val in state_dict.items()}
+        weights = {}
+        for key, val in state_dict.items():
+            weights[key] = val
         return weights
+
+def snip_forward_linear(self, x):
+    return F.linear(x, self.weight * self.weight_mask, self.bias)
+
+
+def snip_forward_conv2d(self, x):
+        return F.conv2d(x, self.weight * self.weight_mask, self.bias,
+                        self.stride, self.padding, self.dilation, self.groups)
