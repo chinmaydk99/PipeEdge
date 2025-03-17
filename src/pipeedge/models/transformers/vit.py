@@ -309,6 +309,7 @@ class ViTShardForImageClassification(ModuleShard):
         # Log sparsity
         for name, mask in self.masks.items():
             density = torch.sum(mask) / mask.numel()
+            print(f"Layer:{str(name)} => Density: {torch.sum(mask)/torch.numel(mask)}")
             logger.debug(f"Layer {name} => Density: {density:.4f}")
 
         # Return pruned weights
