@@ -288,6 +288,14 @@ class ViTShardForImageClassification(ModuleShard):
         
         # Calculate prune percentage from keep ratio
         prune_percent = 100 * (1 - keep_ratio)
+
+        if keep_ratio >= 1.0:
+            print("No pruning performed (keep_ratio >= 1.0)")
+            state_dict = net.state_dict()
+            weights = {}
+            for key, val in state_dict.items():
+                weights[key] = val
+            return weights
         
         # Collect all prunable layers (Linear layers only)
         prunable_layers = []
