@@ -296,7 +296,7 @@ class ViTShardForImageClassification(ModuleShard):
         threshold, _ = torch.topk(all_magnitudes, num_params_to_keep, sorted=True)
         acceptable_magnitude = threshold[-1]
 
-        # Step 4: Update masks and reset weights
+        # Update masks and reset weights
         for name, param in self.named_parameters():
             if 'weight' in name and name in self.masks:  # Prunable Linear layers
                 mask = (torch.abs(param.data) >= acceptable_magnitude).float()
@@ -306,12 +306,12 @@ class ViTShardForImageClassification(ModuleShard):
                 self.masks[name] = torch.ones_like(param.data)
                 param.data = self.initial_weights[name]
 
-        # Step 5: Log sparsity
+        # Log sparsity
         for name, mask in self.masks.items():
             density = torch.sum(mask) / mask.numel()
             logger.debug(f"Layer {name} => Density: {density:.4f}")
 
-        # Step 6: Return pruned weights
+        # Return pruned weights
         state_dict = self.state_dict()
         weights = {key: val for key, val in state_dict.items()}
         return weights
