@@ -27,6 +27,7 @@ class EnhancedReportAccuracy():
         self.partition = partition
         self.quant = quant
         self.model_name = model_name.split('/')[1]
+        self.pruning_keep_ratio = None  # Will store the pruning keep ratio
         
         # Create directory if it doesn't exist
         self.file_path = os.path.join(self.output_dir, self.model_name)
@@ -39,6 +40,10 @@ class EnhancedReportAccuracy():
         
         # Initialize sparsity dict
         self.sparsity_info = {}
+        
+    def set_pruning_keep_ratio(self, keep_ratio):
+        """Set the pruning keep ratio"""
+        self.pruning_keep_ratio = keep_ratio
         
     def update(self, pred, target):
         self.correct = pred.eq(target.view(1, -1).expand_as(pred)).float().sum()
@@ -64,12 +69,16 @@ class EnhancedReportAccuracy():
                 density = float(layer_info.split("Density:")[1].strip())
                 sparsity = 1.0 - density
                 
+                # Add a counter to make the key unique
+                counter = len(self.sparsity_info) + 1
+                key = f"{counter}_{layer_name}"
+                
                 # Store in dict
-                self.sparsity_info[layer_name] = sparsity
+                self.sparsity_info[key] = sparsity
                 
                 # Also write to file immediately
                 with open(self.sparsity_file, 'a') as f:
-                    f.write(f"{layer_name}: {sparsity:.6f}\n")
+                    f.write(f"{counter}_{layer_name}: {sparsity:.6f}\n")
                     
             except (ValueError, IndexError) as e:
                 print(f"Error parsing layer info: {e}")
@@ -79,7 +88,12 @@ class EnhancedReportAccuracy():
         with open(self.final_file, 'w') as f:
             f.write(f"Model: {self.model_name}\n")
             f.write(f"Partition: {self.partition}\n")
-            f.write(f"Quantization: {self.quant}\n")
+            
+            # Include pruning information if available
+            if self.pruning_keep_ratio is not None:
+                f.write(f"Pruning Keep Ratio: {self.pruning_keep_ratio}\n")
+                f.write(f"Pruning Factor: {1.0 - self.pruning_keep_ratio:.6f}\n")
+                
             f.write(f"Final Accuracy: {100*self.total_acc:.6f}%\n")
             f.write(f"Total Batches: {self.tested_batch}\n\n")
             
@@ -181,6 +195,10 @@ def evaluation(args, dataset_cfg):
         pruned_model_file = model_cfg._MODEL_CONFIGS[model_name]['pruned_weights_file']
         # dataset_split = 'train'
         print("keep ratio : ", keep_ratio, ",      train_data size : ", train_batch_size)
+        
+        # Set the pruning keep ratio in the accuracy reporter
+        acc_reporter.set_pruning_keep_ratio(keep_ratio)
+        
         train_dataset = ImageFolder(os.path.join(dataset_path, 'train'), transform = val_transform)
         train_loader = DataLoader(
             train_dataset,
@@ -199,7 +217,7 @@ def evaluation(args, dataset_cfg):
             # Capture the density outputs during pruning
             output_buffer = io.StringIO()
             with redirect_stdout(output_buffer):
-                weights = model.prune_snip(ubatch, ubatch_labels, keep_ratio)
+                weights = model.prune_magnitude(ubatch, ubatch_labels, keep_ratio)
             
             # Process captured output
             for line in output_buffer.getvalue().split('\n'):

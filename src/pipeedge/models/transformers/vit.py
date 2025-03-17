@@ -15,6 +15,7 @@ from transformers.models.vit.modeling_vit import (
 from .. import ModuleShard, ModuleShardConfig
 from . import TransformerShardData
 import torch.nn.functional as F
+import copy
 
 logger = logging.getLogger(__name__)
 
@@ -208,16 +209,15 @@ class ViTModelShard(ModuleShard):
                     file.flush()
                     os.fsync(file.fileno())
 
+
 class ViTShardForImageClassification(ModuleShard):
-    """Module shard based on `ViTForImageClassification` with magnitude-based pruning."""
+    """Module shard based on `ViTForImageClassification`."""
     def __init__(self, config: ViTConfig, shard_config: ModuleShardConfig,
                  model_weights: Union[str, Mapping], prune=False):
         super().__init__(config, shard_config)
         self.vit = None
         self.classifier = None
-        self.initial_weights = None  # Store initial weights for Lottery Ticket reset
-        self.masks = {}  # Persistent masks for pruning
-        
+            
         logger.debug(">>>> Model name: %s", self.config.name_or_path)
         if isinstance(model_weights, str):
             logger.debug(">>>> Load weight file: %s", model_weights)
@@ -225,16 +225,11 @@ class ViTShardForImageClassification(ModuleShard):
                 self._build_shard(weights, prune)
         else:
             self._build_shard(model_weights, prune)
-        
-        # Initialize pruning infrastructure after building
-        self.initial_weights = self.state_dict()  # Capture initial weights post-load
-        for name, param in self.named_parameters():
-            if 'weight' in name and 'patch_embeddings' not in name:  # Exclude patch embeddings
-                self.masks[name] = torch.ones_like(param.data)
 
     def _build_shard(self, weights, prune=False):
-        """Build the shard with ViT model and classifier."""
+        ## all shards use the inner ViT model
         self.vit = ViTModelShard(self.config, self.shard_config, weights, prune)
+
         if self.shard_config.is_last:
             logger.debug(">>>> Load classifier for the last shard")
             self.classifier = nn.Linear(self.config.hidden_size, self.config.num_labels) if self.config.num_labels > 0 else nn.Identity()
@@ -242,8 +237,7 @@ class ViTShardForImageClassification(ModuleShard):
 
     @torch.no_grad()
     def _load_weights_last(self, weights, prune=False):
-        """Load classifier weights."""
-        if prune:
+        if(prune):
             self.classifier.weight.copy_(torch.from_numpy(weights['classifier.weight']))
             self.classifier.bias.copy_(torch.from_numpy(weights['classifier.bias']))
         else:
@@ -251,10 +245,7 @@ class ViTShardForImageClassification(ModuleShard):
             self.classifier.bias.copy_(torch.from_numpy(weights["head/bias"]))
 
     def forward(self, data: TransformerShardData) -> TransformerShardData:
-        """Compute shard layers, applying masks to enforce pruning."""
-        for name, param in self.named_parameters():
-            if 'weight' in name and name in self.masks:
-                param.data = param.data * self.masks[name]
+        """Compute shard layers."""
         data = self.vit(data)
         if self.shard_config.is_last:
             data = self.classifier(data[:, 0, :])
@@ -266,53 +257,82 @@ class ViTShardForImageClassification(ModuleShard):
         """Save the model weights file."""
         ViTModelShard.save_weights(model_name, model_file, url=url, timeout_sec=timeout_sec)
 
-    def prune_magnitude(self, ubatch, ubatch_labels, keep_ratio=0.9, acc_threshold=0.2):
-        """Prune the model based on weight magnitude, inspired by LotteryFL."""
-        # Evaluating  current accuracy
-        self.eval()
-        with torch.no_grad():
-            outputs = self.forward(ubatch)
-            loss = F.nll_loss(outputs, ubatch_labels)
-            _, preds = torch.max(outputs, 1)
-            accuracy = torch.sum(preds == ubatch_labels).item() / len(ubatch_labels)
-
-        # Skip pruning if accuracy is below threshold
-        if accuracy < acc_threshold:
-            logger.debug(f"Accuracy {accuracy:.4f} below threshold {acc_threshold}, skipping pruning")
+    def prune_magnitude(self, ubatch, ubatch_labels, keep_ratio=0.9):
+        """
+        Magnitude-based pruning for ViT.
+        
+        Args:
+            ubatch: Input batch (not used but kept for API compatibility)
+            ubatch_labels: Labels for batch (not used but kept for API compatibility)
+            keep_ratio: Percentage of weights to keep (0.9 = 90%)
+            
+        Returns:
+            Pruned model weights
+        """
+        print(f"Starting magnitude-based pruning with keep_ratio: {keep_ratio}")
+        
+        # Create a copy for pruning
+        net = copy.deepcopy(self)
+        
+        # Collect all linear layers for pruning (excluding patch embeddings)
+        linear_layers = []
+        for name, module in net.named_modules():
+            if isinstance(module, nn.Linear) and "patch_embeddings" not in name:
+                linear_layers.append((name, module))
+        
+        # Get all weights from linear layers
+        all_weights = []
+        for _, layer in linear_layers:
+            all_weights.append(torch.abs(layer.weight.data).flatten())
+        
+        if not all_weights:
+            print("No prunable layers found!")
             return self.state_dict()
-
-        # Compute magnitude-based pruning for Linear layers only (like in snip excluding patch embeddings)
-        magnitudes = []
-        for name, param in self.named_parameters():
-            if 'weight' in name and name in self.masks:  # Only prunable layers (Linear)
-                magnitudes.append(torch.abs(param.data).flatten())
-
-        if not magnitudes:
-            logger.debug("No prunable layers found in this shard")
-            return self.state_dict()
-
-        all_magnitudes = torch.cat(magnitudes)
-        num_params_to_keep = int(len(all_magnitudes) * keep_ratio)
-        threshold, _ = torch.topk(all_magnitudes, num_params_to_keep, sorted=True)
-        acceptable_magnitude = threshold[-1]
-
-        # Update masks and reset weights
-        for name, param in self.named_parameters():
-            if 'weight' in name and name in self.masks:  # Prunable Linear layers
-                mask = (torch.abs(param.data) >= acceptable_magnitude).float()
-                self.masks[name] = mask
-                param.data = self.initial_weights[name] * mask
-            elif 'weight' in name and 'patch_embeddings' in name:  # Protect patch embeddings
-                self.masks[name] = torch.ones_like(param.data)
-                param.data = self.initial_weights[name]
-
-        # Log sparsity
-        for name, mask in self.masks.items():
-            density = torch.sum(mask) / mask.numel()
-            print(f"Layer:{str(name)} => Density: {torch.sum(mask)/torch.numel(mask)}")
-            logger.debug(f"Layer {name} => Density: {density:.4f}")
-
-        # Return pruned weights
-        state_dict = self.state_dict()
-        weights = {key: val for key, val in state_dict.items()}
+            
+        all_weights_concat = torch.cat(all_weights)
+        
+        # Calculate threshold based on keep_ratio
+        threshold_idx = int(all_weights_concat.numel() * (1 - keep_ratio))
+        threshold_value = all_weights_concat.kthvalue(threshold_idx).values.item()
+        
+        print(f"Pruning threshold calculated: {threshold_value}")
+        
+        # Create and apply masks
+        for layer_idx, (name, layer) in enumerate(linear_layers):
+            # Determine if this is first or last layer (don't prune)
+            is_first_layer = layer_idx == 0
+            is_last_layer = layer_idx == len(linear_layers) - 1
+            
+            if is_first_layer or is_last_layer:
+                # Don't prune first and last layers
+                density = 1.0
+                print(f"Skipping pruning for {name} (first/last layer)")
+            else:
+                # Create mask based on magnitude
+                mask = (torch.abs(layer.weight.data) >= threshold_value).float()
+                density = torch.sum(mask) / mask.numel()
+                
+                # Set weights below threshold to zero
+                layer.weight.data = layer.weight.data * mask
+                
+            print(f"Layer {name} => Density: {density:.4f}")
+        
+        # Calculate overall model sparsity
+        total_params = 0
+        zero_params = 0
+        for _, layer in linear_layers:
+            if layer_idx > 0 and layer_idx < len(linear_layers) - 1:  # Skip first and last layers
+                tensor = layer.weight.data.cpu().numpy()
+                total_params += tensor.size
+                zero_params += np.sum(tensor == 0)
+        
+        overall_sparsity = zero_params / total_params if total_params > 0 else 0
+        print(f"Overall model sparsity: {overall_sparsity:.4f} ({zero_params}/{total_params} parameters are zero)")
+        
+        # Return the pruned state dict
+        state_dict = net.state_dict()
+        weights = {}
+        for key, val in state_dict.items():
+            weights[key] = val
+        
         return weights

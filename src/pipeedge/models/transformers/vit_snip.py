@@ -75,7 +75,6 @@ class ViTLayerShard(ModuleShard):
             data = self.output(data[0], data[1])
         return data
 
-
 class ViTModelShard(ModuleShard):
     """Module shard based on `ViTModel` (no pooling layer)."""
 
