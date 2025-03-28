@@ -4,6 +4,7 @@ import argparse
 import time
 import torch
 import numpy as np
+
 import io
 from contextlib import redirect_stdout
 from typing import List
@@ -40,6 +41,7 @@ class EnhancedReportAccuracy():
         
         # Initialize sparsity dict
         self.sparsity_info = {}
+        self.logical_layers = {}  # Store mapping to logical layers
         
     def set_pruning_keep_ratio(self, keep_ratio):
         """Set the pruning keep ratio"""
@@ -78,13 +80,70 @@ class EnhancedReportAccuracy():
                 
                 # Also write to file immediately
                 with open(self.sparsity_file, 'a') as f:
-                    f.write(f"{counter}_{layer_name}: {sparsity:.6f}\n")
+                    f.write(f"{key}: {sparsity:.6f}\n")
                     
             except (ValueError, IndexError) as e:
                 print(f"Error parsing layer info: {e}")
+    
+    def map_to_logical_layers(self):
+        """Map linear layers to logical layers matching the partition scheme"""
+        if not self.sparsity_info:
+            return {}
+            
+        # For ViT: 6 linear layers per transformer block map to 4 logical layers
+        logical_layers = {}
+        
+        # Group layers by their position in the transformer block
+        layer_groups = {}
+        
+        # Process each linear layer and map to logical layers
+        for key, sparsity in self.sparsity_info.items():
+            idx = int(key.split('_')[0])
+            
+            # Calculate which transformer block this belongs to (0-indexed)
+            block_idx = (idx - 1) // 6
+            # Calculate which component within the block (0-5)
+            component_idx = (idx - 1) % 6
+            
+            # Map to logical layer (1-indexed)
+            if component_idx < 3:  # Q, K, V layers (first 3 in each block)
+                logical_idx = block_idx * 4 + 1
+                layer_type = "Attention QKV"
+            elif component_idx == 3:  # Attention output projection
+                logical_idx = block_idx * 4 + 2
+                layer_type = "Attention Output"
+            elif component_idx == 4:  # First MLP layer
+                logical_idx = block_idx * 4 + 3
+                layer_type = "MLP1"
+            else:  # Second MLP layer
+                logical_idx = block_idx * 4 + 4
+                layer_type = "MLP2"
+            
+            # Group by logical layer
+            if logical_idx not in layer_groups:
+                layer_groups[logical_idx] = {
+                    'sparsities': [],
+                    'layer_type': layer_type,
+                    'block': block_idx + 1  # 1-indexed block
+                }
+            layer_groups[logical_idx]['sparsities'].append(sparsity)
+        
+        # Calculate average sparsity for each logical layer
+        for logical_idx, data in layer_groups.items():
+            logical_layers[logical_idx] = {
+                'sparsity': sum(data['sparsities']) / len(data['sparsities']),
+                'layer_type': data['layer_type'],
+                'block': data['block']
+            }
+            
+        self.logical_layers = logical_layers
+        return logical_layers
                 
     def save_final_stats(self):
         """Save final accuracy and other statistics"""
+        # Map to logical layers
+        self.map_to_logical_layers()
+        
         with open(self.final_file, 'w') as f:
             f.write(f"Model: {self.model_name}\n")
             f.write(f"Partition: {self.partition}\n")
@@ -97,13 +156,36 @@ class EnhancedReportAccuracy():
             f.write(f"Final Accuracy: {100*self.total_acc:.6f}%\n")
             f.write(f"Total Batches: {self.tested_batch}\n\n")
             
-            # Write sparsity summary if available
+            # Write original layer-wise sparsity
             if self.sparsity_info:
                 avg_sparsity = sum(self.sparsity_info.values()) / len(self.sparsity_info)
-                f.write(f"Average Sparsity: {avg_sparsity:.6f}\n")
-                f.write("Layer-wise Sparsity:\n")
+                f.write(f"Average Raw Sparsity: {avg_sparsity:.6f}\n")
+                f.write("Linear Layer Sparsity (Raw):\n")
                 for layer, sparsity in self.sparsity_info.items():
                     f.write(f"  {layer}: {sparsity:.6f}\n")
+            
+            # Write logical layer sparsity (matching partition scheme)
+            if self.logical_layers:
+                f.write(f"\nAverage Logical Layer Sparsity: {sum(data['sparsity'] for data in self.logical_layers.values()) / len(self.logical_layers):.6f}\n")
+                f.write("Logical Layer Sparsity (Partitioning Scheme - 48 Layers):\n")
+                
+                # Write embedding layer (not pruned)
+                f.write(f"  Layer 0 (Embedding): 0.000000\n")
+                
+                # Write transformer block layers
+                for idx in range(1, 49):
+                    if idx in self.logical_layers:
+                        data = self.logical_layers[idx]
+                        layer_type = data['layer_type']
+                        block = data['block']
+                        sparsity = data['sparsity']
+                        f.write(f"  Layer {idx} (Block {block}, {layer_type}): {sparsity:.6f}\n")
+                    else:
+                        # If we're missing data for some reason
+                        f.write(f"  Layer {idx} (Missing Data): 0.000000\n")
+                
+                # Write classification layer (not pruned)
+                f.write(f"  Layer 49 (Classification): 0.000000\n")
 
 def _make_shard(model_name, model_file, stage_layers, stage, q_bits, prune):
     shard = model_cfg.module_shard_factory(model_name, model_file, stage_layers[stage][0],
