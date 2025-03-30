@@ -1,4 +1,9 @@
-"""ViT Transformers with Global Magnitude Pruning."""
+"""ViT Transformers with WANDA Pruning.
+
+This module implements the WANDA (Weight-Activation Norm Data-Aware) pruning approach
+for Vision Transformers, based on the paper "A Simple and Effective Pruning Approach
+for Large Language Models" (Sun et al., ICLR 2024).
+"""
 from collections.abc import Mapping
 import logging
 import math
@@ -17,9 +22,6 @@ from . import TransformerShardData
 import torch.nn.functional as F
 import types
 import copy
-
-import pdb
-
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +62,6 @@ class ViTLayerShard(ModuleShard):
     
     def forward(self, data: TransformerShardData) -> TransformerShardData:
         """Compute layer shard."""
-        # pdb.set_trace()
         if self.has_layer(0):
             data_norm = self.layernorm_before(data)
             data = (self.self_attention(data_norm)[0], data)
@@ -132,11 +133,10 @@ class ViTModelShard(ModuleShard):
                 self.embeddings.cls_token.copy_(torch.from_numpy(weights["cls"]))
                 self.embeddings.position_embeddings.copy_(torch.from_numpy((weights["Transformer/posembed_input/pos_embedding"])))
                 conv_weight = weights["embedding/kernel"]
-                # O, I, J, K = conv_weight.shape
-                # conv_weight = conv_weight.reshape(K,J,O,I)
                 conv_weight = conv_weight.transpose([3, 2, 0, 1])
                 self.embeddings.patch_embeddings.projection.weight.copy_(torch.from_numpy(conv_weight))
                 self.embeddings.patch_embeddings.projection.bias.copy_(torch.from_numpy(weights["embedding/bias"]))
+                
     @torch.no_grad()
     def _load_weights_last(self, weights, prune=False):
         if(prune):
@@ -196,7 +196,6 @@ class ViTModelShard(ModuleShard):
                 layer.output.dense.bias.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_1/bias"]).t())
 
     def forward(self, data: TransformerShardData) -> TransformerShardData:
-        # pdb.set_trace()
         """Compute shard layers."""
         if self.shard_config.is_first:
             data = self.embeddings(data)
@@ -221,7 +220,6 @@ class ViTModelShard(ModuleShard):
                     file.write(chunk)
                     file.flush()
                     os.fsync(file.fileno())
-
 
 
 class ViTShardForImageClassification(ModuleShard):
@@ -260,7 +258,6 @@ class ViTShardForImageClassification(ModuleShard):
 
     def forward(self, data: TransformerShardData) -> TransformerShardData:
         """Compute shard layers."""
-        # pdb.set_trace()
         data = self.vit(data)
         if self.shard_config.is_last:
             data = self.classifier(data[:, 0, :])
@@ -272,88 +269,18 @@ class ViTShardForImageClassification(ModuleShard):
         """Save the model weights file."""
         ViTModelShard.save_weights(model_name, model_file, url=url, timeout_sec=timeout_sec)
 
-    # Magnitude Based Pruning (Original Method - Per-Layer with Global Threshold)
-    def prune_magnitude(self, keep_ratio=0.9):
+    # WANDA Pruning Implementation
+    def prune_wanda(self, ubatch, keep_ratio=0.9):
         """
-        Prune ViT model using magnitude-based pruning with a global threshold
-        applied per layer.
+        Prune ViT model using WANDA (Weight-Activation Norm Data-Aware) pruning.
+        
+        This method implements the WANDA pruning approach from Sun et al. (ICLR 2024),
+        which prunes weights based on the product of weight magnitude and input activation
+        norm, and applies pruning on a per-output basis.
         
         Args:
+            ubatch: Batch of input data for calibration (determines activation patterns)
             keep_ratio: Percentage of weights to keep (0-1)
-        
-        Returns:
-            Dictionary of pruned weights compatible with the pipeline
-        """
-        # Create a copy of the model to work with
-        net = copy.deepcopy(self)
-        
-        # Calculate prune percentage from keep ratio
-        prune_percent = 100 * (1 - keep_ratio)
-
-        if keep_ratio >= 1.0:
-            print("No pruning performed (keep_ratio >= 1.0)")
-            state_dict = net.state_dict()
-            weights = {}
-            for key, val in state_dict.items():
-                weights[key] = val
-            return weights
-        
-        # Collect all prunable layers (Linear layers only)
-        prunable_layers = []
-        for layer in net.modules():
-            if isinstance(layer, nn.Linear):
-                prunable_layers.append(layer)
-        
-        # Create masks initialized to all ones
-        masks = []
-        for layer in prunable_layers:
-            mask = torch.ones_like(layer.weight.data)
-            masks.append(mask)
-        
-        # Collect all weights for global threshold calculation
-        all_weights = []
-        for layer in prunable_layers:
-            all_weights.append(layer.weight.data.abs().flatten())
-        
-        # Calculate global threshold based on percentile
-        all_weights = torch.cat(all_weights)
-        threshold = torch.kthvalue(all_weights, 
-                                int(all_weights.numel() * prune_percent / 100)).values
-        
-        # Apply masks based on the threshold and update weights
-        # Skip first and last layer as they're preserved (like in SNIP)
-        for i, (layer, mask) in enumerate(zip(prunable_layers, masks)):
-            if i == 0 or i == len(prunable_layers) - 1:
-                continue
-                
-            # Create mask based on magnitude
-            binary_mask = (layer.weight.data.abs() >= threshold).float()
-            masks[i] = binary_mask
-            
-            # Apply mask to weights
-            layer.weight.data = layer.weight.data * binary_mask
-            
-            # Print statistics
-            density = binary_mask.sum().item() / binary_mask.numel()
-            sparsity = 1.0 - density
-            print(f"Layer:{layer} => Sparsity: {sparsity:.4f}")
-        
-        # Convert state dict to the format expected by the pipeline
-        state_dict = net.state_dict()
-        weights = {}
-        for key, val in state_dict.items():
-            weights[key] = val
-        
-        return weights
-    
-    # NEW METHOD: True Global Magnitude Pruning
-    def prune_true_global(self, keep_ratio=0.9):
-        """
-        True global magnitude pruning - keeps the top X% weights across the entire network,
-        regardless of which layer they belong to.
-        
-        Args:
-            keep_ratio: Percentage of weights to keep (0-1) globally
         
         Returns:
             Dictionary of pruned weights compatible with the pipeline
@@ -370,59 +297,96 @@ class ViTShardForImageClassification(ModuleShard):
                 weights[key] = val
             return weights
         
-        # Collect all prunable layers (Linear layers only)
-        prunable_layers = []
-        for layer in net.modules():
-            if isinstance(layer, nn.Linear):
-                prunable_layers.append(layer)
+        # Storage for activation statistics
+        activation_stats = {}
         
-        # Skip first and last layer as they're preserved
-        prunable_layers_filtered = prunable_layers[1:-1]
+        # Define hook to capture input activations
+        def hook_fn(name):
+            def _hook(module, input_tensor, output):
+                # Store the input tensor (first element of input tuple)
+                if isinstance(input_tensor, tuple):
+                    input_tensor = input_tensor[0]
+                activation_stats[name] = input_tensor.detach()
+            return _hook
         
-        # Store weight magnitudes and their corresponding indices
-        # Format: [(layer_idx, row, col, magnitude), ...]
-        weight_info = []
+        # Get all linear layers in the model
+        linear_layers = []
+        layer_names = []
+        for name, module in net.named_modules():
+            if isinstance(module, nn.Linear):
+                linear_layers.append(module)
+                layer_names.append(name)
+                # Register forward hook to capture inputs
+                module.register_forward_hook(hook_fn(name))
         
-        # Collect all weights with their layer indices
-        for layer_idx, layer in enumerate(prunable_layers_filtered):
-            weight_tensor = layer.weight.data.abs()
-            for r in range(weight_tensor.shape[0]):
-                for c in range(weight_tensor.shape[1]):
-                    weight_info.append((layer_idx, r, c, weight_tensor[r, c].item()))
+        # Run the model on calibration data to collect activations
+        with torch.no_grad():
+            _ = net(ubatch)
         
-        # Sort weights by magnitude (ascending)
-        weight_info.sort(key=lambda x: x[3])
+        # Now compute activation norms and WANDA scores
+        wanda_scores = {}
+        masks = {}
         
-        # Calculate number of weights to prune
-        total_weights = len(weight_info)
-        num_to_prune = int(total_weights * (1 - keep_ratio))
-        
-        # Create binary masks for each layer (all ones initially)
-        masks = []
-        for layer in prunable_layers_filtered:
-            mask = torch.ones_like(layer.weight.data)
-            masks.append(mask)
-        
-        # Prune the smallest weights
-        for i in range(num_to_prune):
-            layer_idx, row, col, _ = weight_info[i]
-            masks[layer_idx][row, col] = 0
-        
-        # Apply masks and calculate densities
-        for i, (layer, mask) in enumerate(zip(prunable_layers_filtered, masks)):
-            # Apply mask
+        for i, (name, layer) in enumerate(zip(layer_names, linear_layers)):
+            # Skip first and last layers (we preserve these)
+            if i == 0 or i == len(linear_layers) - 1:
+                # Create all-ones mask for preserved layers
+                mask = torch.ones_like(layer.weight.data)
+                masks[name] = mask
+                continue
+                
+            # Get the input activations for this layer
+            activations = activation_stats[name]
+            
+            # Compute feature norms - L2 norm across batch dimension
+            # Shape: [input_dim]
+            feature_norms = torch.norm(activations, dim=0)
+            
+            # Handle potential NaNs or zeros in norms
+            feature_norms = torch.where(
+                torch.isnan(feature_norms) | (feature_norms == 0),
+                torch.ones_like(feature_norms),
+                feature_norms
+            )
+            
+            # Compute WANDA scores (weight × activation norm)
+            # For each output neuron, score its weights by the product
+            # Shape: [output_dim, input_dim]
+            W = layer.weight.data
+            scores = torch.abs(W) * feature_norms.unsqueeze(0)
+            wanda_scores[name] = scores
+            
+            # Create mask (all ones initially)
+            mask = torch.ones_like(W)
+            
+            # For each output neuron, keep the top k% weights
+            k = int(W.shape[1] * keep_ratio)
+            for j in range(W.shape[0]):  # For each output neuron
+                if k < W.shape[1]:  # Only prune if we're keeping less than 100%
+                    # Get scores for this output neuron
+                    neuron_scores = scores[j]
+                    
+                    # Get threshold for top k elements
+                    threshold, _ = torch.topk(neuron_scores, k, sorted=True)
+                    # Use the smallest value in the top-k as our threshold
+                    threshold_value = threshold[-1]
+                    
+                    # Create binary mask for this neuron based on threshold
+                    mask[j] = (neuron_scores >= threshold_value).float()
+            
+            # Apply mask to weights
             layer.weight.data = layer.weight.data * mask
+            masks[name] = mask
             
             # Print statistics
-            density = mask.sum().item() / mask.numel()
-            sparsity = 1.0 - density
-            print(f"Layer:{layer} => Sparsity: {sparsity:.4f}")
+            sparsity = 1.0 - (mask.sum().item() / mask.numel())
+            print(f"Layer:{name} => Sparsity: {sparsity:.4f}")
         
-        # First and last layers are fully preserved (density 1.0)
-        print(f"Layer:{prunable_layers[0]} => Sparsity: 0.0000")
-        print(f"Layer:{prunable_layers[-1]} => Sparsity: 0.0000")
+        # Print statistics for first and last layers (fully preserved)
+        print(f"Layer:{layer_names[0]} => Sparsity: 0.0000")
+        print(f"Layer:{layer_names[-1]} => Sparsity: 0.0000")
         
-        # Convert state dict to the format expected by the pipeline
+        # Convert state dict to expected format
         state_dict = net.state_dict()
         weights = {}
         for key, val in state_dict.items():
