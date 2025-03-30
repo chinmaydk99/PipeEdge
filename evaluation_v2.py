@@ -61,15 +61,19 @@ class EnhancedReportAccuracy():
             f.write(f"{100*self.total_acc:.2f}\n")
             
     def capture_sparsity(self, layer_info):
-        """Capture layer density information from console output"""
-        if "Layer:" in layer_info and "Density:" in layer_info:
+        """Capture layer density/sparsity information from console output"""
+        if "Layer:" in layer_info and ("Density:" in layer_info or "Sparsity:" in layer_info):
             # Parse the layer info string
             try:
                 # Extract layer name
                 layer_name = layer_info.split("Layer:")[1].split("=>")[0].strip()
-                # Extract density value
-                density = float(layer_info.split("Density:")[1].strip())
-                sparsity = 1.0 - density
+                
+                # Extract sparsity value - handle both formats
+                if "Density:" in layer_info:
+                    density = float(layer_info.split("Density:")[1].strip())
+                    sparsity = 1.0 - density
+                else:  # "Sparsity:" in layer_info
+                    sparsity = float(layer_info.split("Sparsity:")[1].strip())
                 
                 # Add a counter to make the key unique
                 counter = len(self.sparsity_info) + 1
@@ -310,7 +314,6 @@ def evaluation(args, dataset_cfg):
             # Capture the density outputs during pruning
             output_buffer = io.StringIO()
             with redirect_stdout(output_buffer):
-                # weights = model.prune_magnitude(keep_ratio)
                 weights = model.prune_true_global(keep_ratio)
             
             # Process captured output
