@@ -343,4 +343,88 @@ class ViTShardForImageClassification(ModuleShard):
             weights[key] = val
         
         return weights
+    
+    # Global Magnitiude Based Pruning
+    def prune_true_global(self, keep_ratio=0.9):
+        """
+        True global magnitude pruning - keeps the top X% weights across the entire network,
+        regardless of which layer they belong to.
+        
+        Args:
+            keep_ratio: Percentage of weights to keep (0-1) globally
+        
+        Returns:
+            Dictionary of pruned weights compatible with the pipeline
+        """
+        # Create a copy of the model to work with
+        net = copy.deepcopy(self)
+        
+        # Skip if keep_ratio is 1.0 or greater
+        if keep_ratio >= 1.0:
+            print("No pruning performed (keep_ratio >= 1.0)")
+            state_dict = net.state_dict()
+            weights = {}
+            for key, val in state_dict.items():
+                weights[key] = val
+            return weights
+        
+        # Collect all prunable layers (Linear layers only)
+        prunable_layers = []
+        for layer in net.modules():
+            if isinstance(layer, nn.Linear):
+                prunable_layers.append(layer)
+        
+        # Skip first and last layer as they're preserved
+        prunable_layers_filtered = prunable_layers[1:-1]
+        
+        # Store weight magnitudes and their corresponding indices
+        # Format: [(layer_idx, row, col, magnitude), ...]
+        weight_info = []
+        
+        # Collect all weights with their layer indices
+        for layer_idx, layer in enumerate(prunable_layers_filtered):
+            weight_tensor = layer.weight.data.abs()
+            for r in range(weight_tensor.shape[0]):
+                for c in range(weight_tensor.shape[1]):
+                    weight_info.append((layer_idx, r, c, weight_tensor[r, c].item()))
+        
+        # Sort weights by magnitude (ascending)
+        weight_info.sort(key=lambda x: x[3])
+        
+        # Calculate number of weights to prune
+        total_weights = len(weight_info)
+        num_to_prune = int(total_weights * (1 - keep_ratio))
+        
+        # Create binary masks for each layer (all ones initially)
+        masks = []
+        for layer in prunable_layers_filtered:
+            mask = torch.ones_like(layer.weight.data)
+            masks.append(mask)
+        
+        # Prune the smallest weights
+        for i in range(num_to_prune):
+            layer_idx, row, col, _ = weight_info[i]
+            masks[layer_idx][row, col] = 0
+        
+        # Apply masks and calculate densities
+        for i, (layer, mask) in enumerate(zip(prunable_layers_filtered, masks)):
+            # Apply mask
+            layer.weight.data = layer.weight.data * mask
+            
+            # Print statistics
+            density = mask.sum().item() / mask.numel()
+            sparsity = 1.0 - density
+            print(f"Layer:{layer} => Sparsity: {sparsity:.4f}")
+        
+        # First and last layers are fully preserved (density 1.0)
+        print(f"Layer:{prunable_layers[0]} => Sparsity: 0.0000")
+        print(f"Layer:{prunable_layers[-1]} => Sparsity: 0.0000")
+        
+        # Convert state dict to the format expected by the pipeline
+        state_dict = net.state_dict()
+        weights = {}
+        for key, val in state_dict.items():
+            weights[key] = val
+        
+        return weights
 
