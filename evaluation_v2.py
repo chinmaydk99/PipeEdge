@@ -314,11 +314,11 @@ def evaluation(args, dataset_cfg):
             # Capture the density outputs during pruning
             output_buffer = io.StringIO()
             with redirect_stdout(output_buffer):
-                weights = model.prune_true_global(keep_ratio)
+                weights = model.prune_layerwise(keep_ratio)
             
             # Process captured output
             for line in output_buffer.getvalue().split('\n'):
-                if "Layer:" in line and "Density:" in line:
+                if "Layer:" in line and ("Sparsity:" in line or "Density:" in line):
                     acc_reporter.capture_sparsity(line)
 
             np.savez(pruned_model_file, **weights)

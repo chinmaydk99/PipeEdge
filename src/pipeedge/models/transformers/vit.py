@@ -345,15 +345,14 @@ class ViTShardForImageClassification(ModuleShard):
             weights[key] = val
         
         return weights
-    
-    # NEW METHOD: True Global Magnitude Pruning
-    def prune_true_global(self, keep_ratio=0.9):
+
+    # Efficient Layer-wise Magnitude Pruning
+    def prune_layerwise(self, keep_ratio=0.9):
         """
-        True global magnitude pruning - keeps the top X% weights across the entire network,
-        regardless of which layer they belong to.
+        Efficient layer-wise magnitude pruning - each layer independently pruned to the same sparsity level.
         
         Args:
-            keep_ratio: Percentage of weights to keep (0-1) globally
+            keep_ratio: Percentage of weights to keep (0-1) in each layer
         
         Returns:
             Dictionary of pruned weights compatible with the pipeline
@@ -379,48 +378,41 @@ class ViTShardForImageClassification(ModuleShard):
         # Skip first and last layer as they're preserved
         prunable_layers_filtered = prunable_layers[1:-1]
         
-        # Store weight magnitudes and their corresponding indices
-        # Format: [(layer_idx, row, col, magnitude), ...]
-        weight_info = []
+        # Track total weights and pruned weights
+        total_weights = 0
+        total_pruned = 0
         
-        # Collect all weights with their layer indices
-        for layer_idx, layer in enumerate(prunable_layers_filtered):
-            weight_tensor = layer.weight.data.abs()
-            for r in range(weight_tensor.shape[0]):
-                for c in range(weight_tensor.shape[1]):
-                    weight_info.append((layer_idx, r, c, weight_tensor[r, c].item()))
-        
-        # Sort weights by magnitude (ascending)
-        weight_info.sort(key=lambda x: x[3])
-        
-        # Calculate number of weights to prune
-        total_weights = len(weight_info)
-        num_to_prune = int(total_weights * (1 - keep_ratio))
-        
-        # Create binary masks for each layer (all ones initially)
-        masks = []
-        for layer in prunable_layers_filtered:
-            mask = torch.ones_like(layer.weight.data)
-            masks.append(mask)
-        
-        # Prune the smallest weights
-        for i in range(num_to_prune):
-            layer_idx, row, col, _ = weight_info[i]
-            masks[layer_idx][row, col] = 0
-        
-        # Apply masks and calculate densities
-        for i, (layer, mask) in enumerate(zip(prunable_layers_filtered, masks)):
-            # Apply mask
-            layer.weight.data = layer.weight.data * mask
+        # Process each layer independently
+        for i, layer in enumerate(prunable_layers_filtered):
+            # Get weight magnitudes for this layer
+            weight_magnitudes = layer.weight.data.abs().flatten()
+            num_weights = weight_magnitudes.numel()
+            total_weights += num_weights
             
-            # Print statistics
-            density = mask.sum().item() / mask.numel()
-            sparsity = 1.0 - density
-            print(f"Layer:{layer} => Sparsity: {sparsity:.4f}")
+            # Calculate threshold for this specific layer
+            k = int(num_weights * (1 - keep_ratio))
+            if k > 0:  # Only if we need to prune something
+                threshold = torch.kthvalue(weight_magnitudes, k).values
+                
+                # Create and apply mask
+                binary_mask = (layer.weight.data.abs() >= threshold).float()
+                layer.weight.data = layer.weight.data * binary_mask
+                
+                # Track statistics
+                pruned_in_layer = num_weights - binary_mask.sum().item()
+                total_pruned += pruned_in_layer
+                sparsity = pruned_in_layer / num_weights
+                print(f"Layer:{layer} => Sparsity: {sparsity:.4f}, Threshold: {threshold:.6f}")
+            else:
+                print(f"Layer:{layer} => Sparsity: 0.0000 (no pruning needed)")
         
-        # First and last layers are fully preserved (density 1.0)
+        # First and last layers are fully preserved
         print(f"Layer:{prunable_layers[0]} => Sparsity: 0.0000")
         print(f"Layer:{prunable_layers[-1]} => Sparsity: 0.0000")
+        
+        # Report overall sparsity
+        overall_sparsity = total_pruned / total_weights
+        print(f"Overall sparsity: {overall_sparsity:.4f} (target per-layer: {1-keep_ratio:.4f})")
         
         # Convert state dict to the format expected by the pipeline
         state_dict = net.state_dict()
