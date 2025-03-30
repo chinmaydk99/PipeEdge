@@ -310,7 +310,8 @@ def evaluation(args, dataset_cfg):
             # Capture the density outputs during pruning
             output_buffer = io.StringIO()
             with redirect_stdout(output_buffer):
-                weights = model.prune_magnitude(keep_ratio)
+                # weights = model.prune_magnitude(keep_ratio)
+                weights = model.prune_true_global(keep_ratio)
             
             # Process captured output
             for line in output_buffer.getvalue().split('\n'):
