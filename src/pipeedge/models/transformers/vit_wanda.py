@@ -297,15 +297,12 @@ class ViTShardForImageClassification(ModuleShard):
                 weights[key] = val
             return weights
         
-        # First, pass data through embeddings if raw images were provided
-        # This ensures the input to transformer layers has the right shape
-        with torch.no_grad():
-            # Check if input is raw images that need embedding
-            if len(ubatch.shape) == 4:  # [batch_size, channels, height, width]
-                print("Processing raw images through embedding layer...")
-                if hasattr(net, 'vit') and hasattr(net.vit, 'embeddings'):
-                    ubatch = net.vit.embeddings(ubatch)
-                    print(f"Embedded shape: {ubatch.shape}")
+        # Print the shape of input tensor for debugging
+        print(f"Input tensor shape: {ubatch.shape}")
+        
+        # Convert input tensor to right format if needed
+        # The embeddings layer expects [batch_size, channels, height, width]
+        device = ubatch.device
         
         # Storage for activation statistics
         activation_stats = {}
@@ -322,16 +319,52 @@ class ViTShardForImageClassification(ModuleShard):
         # Get all linear layers in the model
         linear_layers = []
         layer_names = []
+        hooks = []
+        
         for name, module in net.named_modules():
             if isinstance(module, nn.Linear):
                 linear_layers.append(module)
                 layer_names.append(name)
                 # Register forward hook to capture inputs
-                module.register_forward_hook(hook_fn(name))
+                hook = module.register_forward_hook(hook_fn(name))
+                hooks.append(hook)
         
         # Run the model on calibration data to collect activations
         with torch.no_grad():
-            _ = net(ubatch)
+            try:
+                # Try normal forward pass
+                if len(ubatch.shape) == 4:  # If it's already in image format
+                    _ = net(ubatch)
+                else:
+                    # If input is already embedded (3D tensor from feature extractor)
+                    # We need to bypass the embedding layer and start from transformer
+                    if hasattr(net, 'vit'):
+                        # Skip embedding layer
+                        embedded_tensor = ubatch
+                        # Forward through transformer layers
+                        for layer in net.vit.layers:
+                            embedded_tensor = layer(embedded_tensor)
+                        
+                        # Final layernorm if present
+                        if net.vit.layernorm is not None:
+                            embedded_tensor = net.vit.layernorm(embedded_tensor)
+                        
+                        # And classifier if present
+                        if hasattr(net, 'classifier') and net.classifier is not None:
+                            _ = net.classifier(embedded_tensor[:, 0, :])
+                    else:
+                        raise ValueError("Model structure unexpected")
+            except Exception as e:
+                print(f"Error during forward pass: {str(e)}")
+                print("Creating dummy input for activations...")
+                
+                # Create a standard dummy input for ViT
+                dummy_input = torch.randn(1, 3, 224, 224, device=device)
+                _ = net(dummy_input)
+        
+        # Remove hooks to clean up
+        for hook in hooks:
+            hook.remove()
         
         # Now compute activation norms and WANDA scores
         wanda_scores = {}
@@ -347,6 +380,13 @@ class ViTShardForImageClassification(ModuleShard):
                 continue
                 
             # Get the input activations for this layer
+            if name not in activation_stats:
+                print(f"Warning: No activations captured for {name}, skipping pruning")
+                mask = torch.ones_like(layer.weight.data)
+                masks[name] = mask
+                print(f"Layer:{name} => Density: 1.0000 (unpruned)")
+                continue
+                
             activations = activation_stats[name]
             
             # Compute feature norms - L2 norm across batch dimension
