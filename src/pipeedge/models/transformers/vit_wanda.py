@@ -297,6 +297,16 @@ class ViTShardForImageClassification(ModuleShard):
                 weights[key] = val
             return weights
         
+        # First, pass data through embeddings if raw images were provided
+        # This ensures the input to transformer layers has the right shape
+        with torch.no_grad():
+            # Check if input is raw images that need embedding
+            if len(ubatch.shape) == 4:  # [batch_size, channels, height, width]
+                print("Processing raw images through embedding layer...")
+                if hasattr(net, 'vit') and hasattr(net.vit, 'embeddings'):
+                    ubatch = net.vit.embeddings(ubatch)
+                    print(f"Embedded shape: {ubatch.shape}")
+        
         # Storage for activation statistics
         activation_stats = {}
         
@@ -333,14 +343,21 @@ class ViTShardForImageClassification(ModuleShard):
                 # Create all-ones mask for preserved layers
                 mask = torch.ones_like(layer.weight.data)
                 masks[name] = mask
+                print(f"Layer:{name} => Density: 1.0000")
                 continue
                 
             # Get the input activations for this layer
             activations = activation_stats[name]
             
             # Compute feature norms - L2 norm across batch dimension
-            # Shape: [input_dim]
-            feature_norms = torch.norm(activations, dim=0)
+            if activations.dim() >= 3:
+                # For attention layers: [batch_size, seq_len, hidden_dim]
+                # First reshape to [batch_size * seq_len, hidden_dim]
+                act_reshaped = activations.reshape(-1, activations.size(-1))
+                feature_norms = torch.norm(act_reshaped, dim=0)
+            else:
+                # For regular layers: [batch_size, hidden_dim]
+                feature_norms = torch.norm(activations, dim=0)
             
             # Handle potential NaNs or zeros in norms
             feature_norms = torch.where(
@@ -349,10 +366,23 @@ class ViTShardForImageClassification(ModuleShard):
                 feature_norms
             )
             
+            # Ensure dimensions match for multiplication
+            W = layer.weight.data
+            input_dim = W.shape[1]
+            
+            # Resize feature_norms if necessary
+            if feature_norms.size(0) != input_dim:
+                print(f"Dimension mismatch in {name}: Weight input dim {input_dim}, feature_norms dim {feature_norms.size(0)}")
+                # If we have too many features, use average of feature norms
+                if feature_norms.size(0) > input_dim:
+                    feature_norms = feature_norms[:input_dim]
+                # If we have too few features, expand by repeating
+                else:
+                    feature_norms = feature_norms.repeat(input_dim // feature_norms.size(0) + 1)[:input_dim]
+            
             # Compute WANDA scores (weight × activation norm)
             # For each output neuron, score its weights by the product
             # Shape: [output_dim, input_dim]
-            W = layer.weight.data
             scores = torch.abs(W) * feature_norms.unsqueeze(0)
             wanda_scores[name] = scores
             
@@ -379,12 +409,8 @@ class ViTShardForImageClassification(ModuleShard):
             masks[name] = mask
             
             # Print statistics
-            sparsity = 1.0 - (mask.sum().item() / mask.numel())
-            print(f"Layer:{name} => Sparsity: {sparsity:.4f}")
-        
-        # Print statistics for first and last layers (fully preserved)
-        print(f"Layer:{layer_names[0]} => Sparsity: 0.0000")
-        print(f"Layer:{layer_names[-1]} => Sparsity: 0.0000")
+            density = mask.sum().item() / mask.numel()
+            print(f"Layer:{name} => Density: {density:.4f}")
         
         # Convert state dict to expected format
         state_dict = net.state_dict()
