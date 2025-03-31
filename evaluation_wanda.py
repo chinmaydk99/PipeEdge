@@ -13,7 +13,7 @@ from torchvision import transforms
 from transformers import DeiTFeatureExtractor, ViTFeatureExtractor
 from runtime import forward_hook_quant_encode, forward_pre_hook_quant_decode
 from utils.data import ViTFeatureExtractorTransforms
-import model_cfg_snip
+import model_cfg_wanda
 from evaluation_tools.evaluation_quant_test import *
 
 class EnhancedReportAccuracy():
@@ -198,7 +198,7 @@ class EnhancedReportAccuracy():
                 f.write(f"  Layer 49 (Classification): 0.000000\n")
 
 def _make_shard(model_name, model_file, stage_layers, stage, q_bits, prune):
-    shard = model_cfg_snip.module_shard_factory(model_name, model_file, stage_layers[stage][0],
+    shard = model_cfg_wanda.module_shard_factory(model_name, model_file, stage_layers[stage][0],
                                             stage_layers[stage][1], stage, prune)
     shard.register_buffer('quant_bits', q_bits)
     shard.eval()
@@ -284,7 +284,7 @@ def evaluation(args, dataset_cfg):
     acc_reporter = EnhancedReportAccuracy(batch_size, output_dir, model_name, partition, quant[0] if quant else 0)
 
     if prune:
-        pruned_model_file = model_cfg_snip._MODEL_CONFIGS[model_name]['pruned_weights_file']
+        pruned_model_file = model_cfg_wanda._MODEL_CONFIGS[model_name]['pruned_weights_file']
         # dataset_split = 'train'
         print("keep ratio : ", keep_ratio, ",      train_data size : ", train_batch_size)
         
@@ -299,17 +299,17 @@ def evaluation(args, dataset_cfg):
             pin_memory=True
         )
         for ubatch, ubatch_labels in train_loader:
-            config = model_cfg_snip.get_model_config(model_name)
-            shard_config = model_cfg_snip.ModuleShardConfig(layer_start=1, layer_end=model_cfg_snip.get_model_layers(model_name),
+            config = model_cfg_wanda.get_model_config(model_name)
+            shard_config = model_cfg_wanda.ModuleShardConfig(layer_start=1, layer_end=model_cfg_wanda.get_model_layers(model_name),
                                             is_first=True, is_last=True)
-            model_file = model_cfg_snip.get_model_default_weights_file(model_name)
+            model_file = model_cfg_wanda.get_model_default_weights_file(model_name)
             
-            model = model_cfg_snip._MODEL_CONFIGS[model_name]['shard_module'](config, shard_config, model_file)
+            model = model_cfg_wanda._MODEL_CONFIGS[model_name]['shard_module'](config, shard_config, model_file)
             
             # Capture the density outputs during pruning
             output_buffer = io.StringIO()
             with redirect_stdout(output_buffer):
-                weights = model.prune_snip(ubatch, ubatch_labels, keep_ratio)
+                weights = model.prune_wanda(ubatch, keep_ratio)
             
             # Process captured output
             for line in output_buffer.getvalue().split('\n'):
@@ -377,7 +377,7 @@ if __name__ == "__main__":
                         help="the number of worker threads for the dataloder")
     # Model options
     parser.add_argument("-m", "--model-name", type=str, default="google/vit-base-patch16-224",
-                        choices=model_cfg_snip.get_model_names(),
+                        choices=model_cfg_wanda.get_model_names(),
                         help="the neural network model for loading")
     parser.add_argument("-M", "--model-file", type=str,
                         help="the model file, if not in working directory")
