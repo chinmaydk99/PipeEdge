@@ -459,3 +459,86 @@ class ViTShardForImageClassification(ModuleShard):
             weights[key] = val
         
         return weights 
+        
+    def prune_wanda_iterative(self, ubatch, final_keep_ratio=0.3, steps=3, mini_test_batch=None):
+        """
+        Iterative WANDA pruning with multiple steps for higher sparsity.
+        
+        Gradually prunes the model in steps, which often achieves higher sparsity
+        with less accuracy degradation than one-shot pruning.
+        
+        Args:
+            ubatch: Batch of input data for calibration (determines activation patterns)
+            final_keep_ratio: Final percentage of weights to keep (0-1)
+            steps: Number of pruning steps to use
+            mini_test_batch: Optional validation batch for monitoring accuracy between steps
+            
+        Returns:
+            Dictionary of pruned weights compatible with the pipeline
+        """
+        print(f"Starting iterative WANDA pruning to target keep ratio {final_keep_ratio} in {steps} steps")
+        
+        # Start with modest pruning
+        current_keep_ratio = 0.9
+        
+        # Calculate step size to reach target
+        step_size = (current_keep_ratio - final_keep_ratio) / steps
+        
+        # Use a copy of the model for iterative pruning
+        net = copy.deepcopy(self)
+        
+        # Track accuracy degradation if test batch provided
+        if mini_test_batch is not None:
+            initial_acc = self._quick_eval(mini_test_batch)
+            print(f"Initial accuracy on mini-batch: {initial_acc:.4f}")
+        
+        # Perform iterative pruning
+        for step in range(steps):
+            current_keep_ratio -= step_size
+            print(f"Pruning step {step+1}/{steps}, keep_ratio = {current_keep_ratio:.2f}")
+            
+            # Apply WANDA pruning at current sparsity level
+            weights = net.prune_wanda(ubatch, current_keep_ratio)
+            
+            # Update model for next iteration
+            net.load_state_dict(weights)
+            
+            # Track accuracy degradation if test batch provided
+            if mini_test_batch is not None:
+                step_acc = net._quick_eval(mini_test_batch)
+                print(f"Accuracy after step {step+1}: {step_acc:.4f} (delta: {step_acc - initial_acc:.4f})")
+                
+                # Potentially backoff if accuracy drops too much
+                if step_acc < initial_acc - 0.20 and step < steps - 1:
+                    print(f"Warning: Large accuracy drop detected. Adjusting remaining pruning steps.")
+                    remaining_steps = steps - step - 1
+                    if remaining_steps > 0:
+                        step_size = step_size * 0.7  # Reduce pruning aggressiveness
+        
+        # Return final weights
+        return weights
+    
+    def _quick_eval(self, test_batch):
+        """
+        Helper method to quickly evaluate model accuracy on a mini-batch.
+        
+        Args:
+            test_batch: Tuple of (inputs, labels) for evaluation
+            
+        Returns:
+            Accuracy as a float between 0 and 1
+        """
+        inputs, labels = test_batch
+        device = next(self.parameters()).device
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+        
+        # Switch to eval mode
+        self.eval()
+        
+        with torch.no_grad():
+            outputs = self(inputs)
+            _, predicted = outputs.max(1)
+            correct = predicted.eq(labels).sum().item()
+            
+        return correct / labels.size(0) 

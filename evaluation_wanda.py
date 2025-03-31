@@ -244,6 +244,8 @@ def evaluation(args, dataset_cfg):
     prune = args.prune
     train_batch_size = args.train_batch_size
     keep_ratio = args.keep_ratio
+    prune_method = args.prune_method
+    iterative_steps = args.iterative_steps
     # if model_file is None:
     #     model_file = model_cfg.get_model_default_weights_file(model_name)
 
@@ -298,6 +300,8 @@ def evaluation(args, dataset_cfg):
             shuffle=True,
             pin_memory=True
         )
+        
+        # Get a single batch for pruning
         for ubatch, ubatch_labels in train_loader:
             config = model_cfg_wanda.get_model_config(model_name)
             shard_config = model_cfg_wanda.ModuleShardConfig(layer_start=1, layer_end=model_cfg_wanda.get_model_layers(model_name),
@@ -308,8 +312,27 @@ def evaluation(args, dataset_cfg):
             
             # Capture the density outputs during pruning
             output_buffer = io.StringIO()
+            
             with redirect_stdout(output_buffer):
-                weights = model.prune_wanda(ubatch, keep_ratio)
+                if prune_method == 'wanda':
+                    # Original WANDA pruning
+                    print(f"Using original WANDA pruning with keep_ratio = {keep_ratio}")
+                    weights = model.prune_wanda(ubatch, keep_ratio)
+                elif prune_method == 'iterative':
+                    # Iterative WANDA pruning
+                    print(f"Using iterative WANDA pruning with final_keep_ratio = {keep_ratio}, steps = {iterative_steps}")
+                    # Get a small validation batch for accuracy tracking if available
+                    mini_test_batch = None
+                    try:
+                        val_iter = iter(val_loader)
+                        mini_test_batch = next(val_iter)
+                    except:
+                        print("Warning: Could not get validation batch for accuracy tracking")
+                    
+                    weights = model.prune_wanda_iterative(ubatch, final_keep_ratio=keep_ratio, 
+                                                          steps=iterative_steps, mini_test_batch=mini_test_batch)
+                else:
+                    raise ValueError(f"Unknown pruning method: {prune_method}")
             
             # Process captured output
             for line in output_buffer.getvalue().split('\n'):
@@ -402,7 +425,11 @@ if __name__ == "__main__":
     dset.add_argument("--prune", type=bool, nargs='?', const=True, default=False,
                       help="Pruning method")
     dset.add_argument("--keep-ratio", type=float, default=0.9,
-                      help="Snip_pruning keep ratio")
+                      help="Pruning keep ratio")
+    dset.add_argument("--prune-method", type=str, default="wanda", choices=["wanda", "iterative"],
+                      help="Pruning method to use (wanda, iterative)")
+    dset.add_argument("--iterative-steps", type=int, default=3,
+                      help="Number of steps for iterative pruning")
     args = parser.parse_args()
 
 
