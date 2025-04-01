@@ -246,6 +246,18 @@ def evaluation(args, dataset_cfg):
     keep_ratio = args.keep_ratio
     prune_method = args.prune_method
     iterative_steps = args.iterative_steps
+    calibrate = args.calibrate
+    calib_steps = args.calib_steps
+    calib_lr = args.calib_lr
+    calib_batch_size = args.calib_batch_size
+    calib_samples = args.calib_samples
+    
+    # If using calibration, switch to calibration-enabled model
+    if calibrate and "-calib" not in model_name:
+        original_model_name = model_name
+        model_name = model_name + "-calib"
+        print(f"Switching to calibration-enabled model: {model_name}")
+    
     # if model_file is None:
     #     model_file = model_cfg.get_model_default_weights_file(model_name)
 
@@ -268,7 +280,9 @@ def evaluation(args, dataset_cfg):
         val_dataset = ImageFolder(os.path.join(dataset_path, dataset_split),
                                 transform = feature_extractor)
     else:
-        feature_extractor = ViTFeatureExtractor.from_pretrained(model_name)
+        # For "-calib" models, use base model name for feature extractor
+        base_model_name = model_name.replace("-calib", "")
+        feature_extractor = ViTFeatureExtractor.from_pretrained(base_model_name)
         val_transform = ViTFeatureExtractorTransforms(feature_extractor)
         val_dataset = ImageFolder(os.path.join(dataset_path, dataset_split),
                                 transform = val_transform)
@@ -314,25 +328,74 @@ def evaluation(args, dataset_cfg):
             output_buffer = io.StringIO()
             
             with redirect_stdout(output_buffer):
-                if prune_method == 'wanda':
-                    # Original WANDA pruning
-                    print(f"Using original WANDA pruning with keep_ratio = {keep_ratio}")
-                    weights = model.prune_wanda(ubatch, keep_ratio)
-                elif prune_method == 'iterative':
-                    # Iterative WANDA pruning
-                    print(f"Using iterative WANDA pruning with final_keep_ratio = {keep_ratio}, steps = {iterative_steps}")
-                    # Get a small validation batch for accuracy tracking if available
-                    mini_test_batch = None
-                    try:
-                        val_iter = iter(val_loader)
-                        mini_test_batch = next(val_iter)
-                    except:
-                        print("Warning: Could not get validation batch for accuracy tracking")
+                if calibrate:
+                    # Create a calibration dataset (subset of training data)
+                    print(f"Using calibration with {calib_samples} samples, {calib_steps} steps, lr={calib_lr}")
+                    # Use a subset of training data for calibration
+                    calib_indices = torch.randperm(len(train_dataset))[:calib_samples]
+                    calib_dataset = torch.utils.data.Subset(train_dataset, calib_indices)
                     
-                    weights = model.prune_wanda_iterative(ubatch, final_keep_ratio=keep_ratio, 
-                                                          steps=iterative_steps, mini_test_batch=mini_test_batch)
+                    calib_loader = DataLoader(
+                        calib_dataset,
+                        batch_size=calib_batch_size,
+                        shuffle=True,
+                        num_workers=num_workers,
+                        pin_memory=True
+                    )
+                    
+                    if prune_method == 'wanda':
+                        # One-shot WANDA pruning with calibration
+                        print(f"Using WANDA pruning with keep_ratio = {keep_ratio} followed by calibration")
+                        weights = model.prune_and_calibrate(
+                            ubatch, 
+                            calib_loader=calib_loader,
+                            keep_ratio=keep_ratio,
+                            calib_steps=calib_steps,
+                            calib_lr=calib_lr
+                        )
+                    elif prune_method == 'iterative':
+                        # Iterative WANDA pruning with calibration
+                        print(f"Using iterative WANDA pruning with final_keep_ratio = {keep_ratio}, steps = {iterative_steps} followed by calibration")
+                        # Get a small validation batch for accuracy tracking if available
+                        mini_test_batch = None
+                        try:
+                            val_iter = iter(val_loader)
+                            mini_test_batch = next(val_iter)
+                        except:
+                            print("Warning: Could not get validation batch for accuracy tracking")
+                        
+                        weights = model.prune_iterative_and_calibrate(
+                            ubatch, 
+                            calib_loader=calib_loader,
+                            final_keep_ratio=keep_ratio, 
+                            prune_steps=iterative_steps, 
+                            calib_steps=calib_steps,
+                            calib_lr=calib_lr,
+                            mini_test_batch=mini_test_batch
+                        )
+                    else:
+                        raise ValueError(f"Unknown pruning method: {prune_method}")
                 else:
-                    raise ValueError(f"Unknown pruning method: {prune_method}")
+                    # Original pruning methods without calibration
+                    if prune_method == 'wanda':
+                        # Original WANDA pruning
+                        print(f"Using original WANDA pruning with keep_ratio = {keep_ratio}")
+                        weights = model.prune_wanda(ubatch, keep_ratio)
+                    elif prune_method == 'iterative':
+                        # Iterative WANDA pruning
+                        print(f"Using iterative WANDA pruning with final_keep_ratio = {keep_ratio}, steps = {iterative_steps}")
+                        # Get a small validation batch for accuracy tracking if available
+                        mini_test_batch = None
+                        try:
+                            val_iter = iter(val_loader)
+                            mini_test_batch = next(val_iter)
+                        except:
+                            print("Warning: Could not get validation batch for accuracy tracking")
+                        
+                        weights = model.prune_wanda_iterative(ubatch, final_keep_ratio=keep_ratio, 
+                                                              steps=iterative_steps, mini_test_batch=mini_test_batch)
+                    else:
+                        raise ValueError(f"Unknown pruning method: {prune_method}")
             
             # Process captured output
             for line in output_buffer.getvalue().split('\n'):
@@ -430,6 +493,20 @@ if __name__ == "__main__":
                       help="Pruning method to use (wanda, iterative)")
     dset.add_argument("--iterative-steps", type=int, default=3,
                       help="Number of steps for iterative pruning")
+                      
+    # Calibration arguments
+    calib = parser.add_argument_group('Calibration arguments')
+    calib.add_argument("--calibrate", type=bool, nargs='?', const=True, default=False,
+                      help="Whether to calibrate/fine-tune the model after pruning")
+    calib.add_argument("--calib-steps", type=int, default=100,
+                      help="Number of steps for calibration")
+    calib.add_argument("--calib-lr", type=float, default=1e-5,
+                      help="Learning rate for calibration")
+    calib.add_argument("--calib-batch-size", type=int, default=32,
+                      help="Batch size for calibration")
+    calib.add_argument("--calib-samples", type=int, default=5000,
+                      help="Number of samples to use for calibration")
+    
     args = parser.parse_args()
 
 
