@@ -31,6 +31,53 @@ _WEIGHTS_URLS = {
     'google/vit-huge-patch14-224-in21k': 'https://storage.googleapis.com/vit_models/imagenet21k/ViT-H_14.npz',
 }
 
+# Helper function needed for reference DSnoT pruning logic
+def return_reorder_indice(input_tensor):
+    """
+    For instance:
+    [[1., -2., 3.],
+    [-2, 2., -4],
+    [5., 6., -7],
+    [-6, -7, -4]]
+    return indices of
+    [[-2.,  3.,  1.],
+    [-2., -4.,  2.],
+    [-7.,  6.,  5.],
+    [-6., -7., -4.]]
+    Description: The relative order in the positive number remains unchanged, and the relative order in the negative number is flipped.
+    """
+    positive_tensor = input_tensor.clone()
+    negative_tensor = input_tensor.clone()
+
+    positive_mask = positive_tensor > 0
+    negative_mask = negative_tensor < 0
+
+    positive_indices = (
+        torch.arange(0, input_tensor.shape[1], device=input_tensor.device)
+        .to(torch.float64)
+        .repeat(input_tensor.shape[0], 1)
+    )
+    negative_indices = (
+        torch.arange(0, input_tensor.shape[1], device=input_tensor.device)
+        .to(torch.float64)
+        .repeat(input_tensor.shape[0], 1)
+    )
+
+    positive_indices[~positive_mask] = float("inf")
+    negative_indices[~negative_mask] = float("inf")
+
+    positive_value, _ = torch.sort(positive_indices, dim=1)
+    negative_value, _ = torch.sort(negative_indices, dim=1)
+
+    positive_value = torch.flip(positive_value, dims=[1])
+
+    negative_value[negative_value == float("inf")] = 0
+    positive_value[positive_value == float("inf")] = 0
+
+    reorder_indice = (positive_value + negative_value).to(torch.int64)
+
+    return reorder_indice
+
 
 class ViTLayerShard(ModuleShard):
     """Module shard based on `ViTLayer`."""
@@ -718,6 +765,289 @@ class ViTShardForImageClassification(ModuleShard):
             module.weight.data = W
         
         # Return weights in the expected format
+        state_dict = sparse_model.state_dict()
+        weights = {}
+        for key, val in state_dict.items():
+            weights[key] = val
+        
+        return weights
+    
+    def prune_dsnot(self, ubatch, keep_ratio=0.5, max_cycles=50, error_threshold=0.1, n_m_ratio=None):
+        """
+        DSnoT (Dynamic Sparse No Training) pruning for ViT models.
+        
+        Implements mask optimization through iterative pruning-and-growing processes to 
+        minimize reconstruction error, without weight updates. This method includes:
+        - Initial pruning using WANDA scores
+        - Error-based reranking of weights
+        - Support for N:M sparsity patterns
+        - Stopping conditions based on error reduction
+        
+        Args:
+            ubatch: Batch of input data for calibration
+            keep_ratio: Percentage of weights to keep (0-1)
+            max_cycles: Maximum optimization cycles per neuron
+            error_threshold: Early stopping threshold (based on error reduction)
+            n_m_ratio: Optional N:M structured sparsity pattern (e.g., (2,4) for 2:4 sparsity)
+            
+        Returns:
+            Dictionary of pruned weights after optimization
+        """
+        print(f"Starting DSnoT pruning with keep_ratio: {keep_ratio}")
+        if n_m_ratio:
+            print(f"Using N:M sparsity pattern: {n_m_ratio[0]}:{n_m_ratio[1]}")
+        
+        # Create initial sparse model using WANDA pruning
+        weights = self.prune_wanda(ubatch, keep_ratio)
+        
+        # Create models for optimization
+        sparse_model = copy.deepcopy(self)
+        sparse_model.load_state_dict(weights)
+        dense_model = copy.deepcopy(self)
+        
+        # Extract device
+        device = next(self.parameters()).device
+        
+        print("Applying DSnoT optimization...")
+        
+        # Process each linear layer
+        for name, module in sparse_model.named_modules():
+            if not isinstance(module, nn.Linear):
+                continue
+                
+            print(f"Optimizing layer: {name}")
+            
+            # Get corresponding dense module
+            dense_module = None
+            for dense_name, dense_mod in dense_model.named_modules():
+                if dense_name == name:
+                    dense_module = dense_mod
+                    break
+            
+            if dense_module is None:
+                print(f"Couldn't find matching dense layer for {name}, skipping")
+                continue
+            
+            # Setup weights and mask
+            W = module.weight.data
+            W_dense = dense_module.weight.data
+            mask = (W != 0).float()
+            
+            # Setup activation gathering
+            activations_dict = {}
+            
+            def get_activation(name):
+                def hook(model, input_tensor, output):
+                    if isinstance(input_tensor, tuple):
+                        input_tensor = input_tensor[0]
+                    activations_dict[name] = input_tensor.detach()
+                return hook
+            
+            # Register hook for input activations
+            handle = module.register_forward_hook(get_activation(name))
+            
+            # Forward pass with calibration data
+            with torch.no_grad():
+                _ = sparse_model(ubatch)
+            
+            # Remove hook
+            handle.remove()
+            
+            # Check for activations
+            if name not in activations_dict:
+                print(f"No activations captured for {name}, skipping")
+                continue
+            
+            # Process activations
+            activations = activations_dict[name]
+            if activations.dim() >= 3:
+                # Reshape for attention layers: [batch_size, seq_len, hidden_dim] → [batch_size*seq_len, hidden_dim] 
+                activations = activations.reshape(-1, activations.size(-1))
+            
+            # Process each output neuron independently
+            for r in range(W.size(0)):
+                # Get weights and mask for this neuron
+                W_r = W_dense[r]
+                W_sparse_r = W[r]
+                mask_r = mask[r]
+                
+                # Calculate outputs and initial error
+                dense_out = torch.matmul(activations, W_r)
+                sparse_out = torch.matmul(activations, W_sparse_r)
+                delta_r = dense_out - sparse_out
+                
+                # N:M sparsity handling
+                if n_m_ratio:
+                    N, M = n_m_ratio
+                    # Need to ensure mask follows N:M pattern where N weights are non-zero out of every M weights
+                    # Reshape mask into groups of M
+                    input_dim = W_r.size(0)
+                    num_complete_groups = input_dim // M
+                    
+                    # Adjust keep_ratio based on N:M pattern
+                    n_m_keep_ratio = N / M
+                    
+                    # Create new mask satisfying N:M constraint
+                    new_mask_r = torch.zeros_like(mask_r)
+                    
+                    # For each group of M weights, keep top N weights
+                    for g in range(num_complete_groups):
+                        group_start = g * M
+                        group_end = (g + 1) * M
+                        group_weights = W_r[group_start:group_end]
+                        group_scores = torch.abs(group_weights)
+                        _, indices = torch.topk(group_scores, N)
+                        group_mask = torch.zeros(M, device=device)
+                        group_mask[indices] = 1
+                        new_mask_r[group_start:group_end] = group_mask
+                    
+                    # Handle remaining weights (incomplete group)
+                    remaining = input_dim % M
+                    if remaining > 0:
+                        group_start = num_complete_groups * M
+                        group_weights = W_r[group_start:]
+                        group_scores = torch.abs(group_weights)
+                        remain_keep = min(remaining, max(1, int(n_m_keep_ratio * remaining)))
+                        _, indices = torch.topk(group_scores, remain_keep)
+                        group_mask = torch.zeros(remaining, device=device)
+                        group_mask[indices] = 1
+                        new_mask_r[group_start:] = group_mask
+                    
+                    # Apply N:M mask to get new sparse weights
+                    mask_r = new_mask_r
+                    W_sparse_r = W_r * mask_r
+                    
+                    # Recalculate error
+                    sparse_out = torch.matmul(activations, W_sparse_r)
+                    delta_r = dense_out - sparse_out
+                
+                # Iterative DSnoT optimization process
+                for t in range(max_cycles):
+                    # Log progress periodically
+                    if t == 0 or (t+1) % 10 == 0 or t == max_cycles-1:
+                        error_norm = torch.norm(delta_r).item()
+                        print(f"Layer:{name}, Row:{r+1}/{W.size(0)}, Cycle:{t+1}/{max_cycles}, Error:{error_norm:.4f}")
+                    
+                    # Calculate expected values for optimization
+                    E_A = torch.mean(activations, dim=0)  # [input_dim]
+                    Var_A = torch.var(activations, dim=0) + 1e-8  # Avoid division by zero
+                    E_delta = torch.mean(delta_r)
+                    
+                    # Create score tensors for growing and pruning decisions
+                    grow_scores = torch.zeros_like(W_r)
+                    prune_scores = torch.zeros_like(W_r)
+                    
+                    # Calculate growing scores (for currently pruned weights)
+                    if E_delta > 0:
+                        # Prioritize weights that would reduce positive error
+                        grow_scores = (~mask_r.bool()) * W_r * E_A / Var_A
+                        # We want to maximize grow_scores when error is positive
+                        grow_idx = torch.argmax(grow_scores).item()
+                    else:
+                        # Prioritize weights that would reduce negative error
+                        grow_scores = (~mask_r.bool()) * W_r * E_A / Var_A
+                        # We want to minimize grow_scores when error is negative
+                        grow_idx = torch.argmin(grow_scores).item()
+                    
+                    # Calculate pruning scores (for currently active weights)
+                    wanda_scores = torch.abs(W_r) * torch.norm(activations, dim=0)
+                    
+                    # For positive error: prefer pruning weights contributing negatively to output
+                    if E_delta > 0:
+                        prune_condition = (W_r * E_A < 0) & mask_r.bool()
+                        if prune_condition.any():
+                            # Prioritize weights based on both WANDA and error contribution
+                            prune_scores = mask_r * wanda_scores
+                            prune_scores[~prune_condition] = float('inf')
+                        else:
+                            # Fallback to basic WANDA scores
+                            prune_scores = mask_r * wanda_scores
+                        prune_idx = torch.argmin(prune_scores).item()
+                    # For negative error: prefer pruning weights contributing positively to output
+                    else:
+                        prune_condition = (W_r * E_A > 0) & mask_r.bool()
+                        if prune_condition.any():
+                            prune_scores = mask_r * wanda_scores
+                            prune_scores[~prune_condition] = float('inf')
+                        else:
+                            prune_scores = mask_r * wanda_scores
+                        prune_idx = torch.argmin(prune_scores).item()
+                    
+                    # N:M sparsity handling - ensure we maintain the N:M pattern
+                    if n_m_ratio:
+                        N, M = n_m_ratio
+                        # Determine which group our grow_idx and prune_idx belong to
+                        grow_group = grow_idx // M
+                        prune_group = prune_idx // M
+                        
+                        # Ensure we maintain N:M pattern (can only grow in a group if we prune from the same group)
+                        if grow_group != prune_group:
+                            # Find alternative indices in the same group
+                            grow_group_start = grow_group * M
+                            grow_group_end = min((grow_group + 1) * M, W_r.size(0))
+                            
+                            # Find best grow candidate in this group
+                            grow_group_scores = grow_scores[grow_group_start:grow_group_end]
+                            if E_delta > 0:
+                                local_grow_idx = torch.argmax(grow_group_scores).item()
+                            else:
+                                local_grow_idx = torch.argmin(grow_group_scores).item()
+                            grow_idx = grow_group_start + local_grow_idx
+                            
+                            # Find best prune candidate in this group
+                            prune_group_scores = prune_scores[grow_group_start:grow_group_end]
+                            prune_group_scores[~mask_r[grow_group_start:grow_group_end].bool()] = float('inf')
+                            local_prune_idx = torch.argmin(prune_group_scores).item()
+                            prune_idx = grow_group_start + local_prune_idx
+                    
+                    # Update mask
+                    old_mask_r = mask_r.clone()
+                    mask_r[grow_idx] = 1
+                    mask_r[prune_idx] = 0
+                    
+                    # Apply updated mask
+                    W_sparse_r = W_r * mask_r
+                    
+                    # Recalculate error
+                    new_sparse_out = torch.matmul(activations, W_sparse_r)
+                    new_delta_r = dense_out - new_sparse_out
+                    
+                    # Check if we've improved the error
+                    prev_error = torch.norm(delta_r).item()
+                    new_error = torch.norm(new_delta_r).item()
+                    error_reduction = prev_error - new_error
+                    
+                    # Early stopping if error improved only marginally or got worse
+                    if error_reduction < error_threshold:
+                        # If we made things worse, revert this step
+                        if error_reduction < 0:
+                            mask_r = old_mask_r
+                            W_sparse_r = W_r * mask_r
+                        break
+                    
+                    # Update error for next iteration
+                    delta_r = new_delta_r
+                
+                # Apply final mask after all iterations
+                mask[r] = mask_r
+                W[r] = W_r * mask_r
+                
+                # Report final density (non-zero weights ratio)
+                density = mask_r.sum().item() / mask_r.numel()
+                print(f"Layer:{name} => Density: {density:.4f}")
+                
+                # Log final error
+                final_error = torch.norm(delta_r).item()
+                print(f"Layer:{name}, Row:{r+1}/{W.size(0)}, Final Error: {final_error:.4f}")
+            
+            # Apply optimized weights to module
+            module.weight.data = W
+            
+            # Calculate overall layer density
+            layer_density = mask.sum().item() / mask.numel()
+            print(f"Layer:{name} => Overall Density: {layer_density:.4f}")
+        
+        # Return optimized weights
         state_dict = sparse_model.state_dict()
         weights = {}
         for key, val in state_dict.items():

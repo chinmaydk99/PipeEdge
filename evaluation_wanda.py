@@ -70,17 +70,14 @@ class EnhancedReportAccuracy():
                 density = float(layer_info.split("Density:")[1].strip())
                 sparsity = 1.0 - density
                 
-                # Add a counter to make the key unique
-                counter = len(self.sparsity_info) + 1
-                key = f"{counter}_{layer_name}"
-                
-                # Store in dict
-                self.sparsity_info[key] = sparsity
-                
-                # Also write to file immediately
-                with open(self.sparsity_file, 'a') as f:
-                    f.write(f"{key}: {sparsity:.6f}\n")
+                # Use layer_name as key and only store if not already present
+                if layer_name not in self.sparsity_info:
+                    self.sparsity_info[layer_name] = sparsity
                     
+                    # Also write to file immediately (using layer_name as identifier)
+                    with open(self.sparsity_file, 'a') as f:
+                        f.write(f"{layer_name}: {sparsity:.6f}\n")
+                        
             except (ValueError, IndexError) as e:
                 print(f"Error parsing layer info: {e}")
     
@@ -96,9 +93,20 @@ class EnhancedReportAccuracy():
         layer_groups = {}
         
         # Process each linear layer and map to logical layers
-        for key, sparsity in self.sparsity_info.items():
-            idx = int(key.split('_')[0])
-            
+        # Need to temporarily re-introduce indexing for mapping logic
+        # We sort the keys to ensure consistent processing order
+        sorted_layer_names = sorted(self.sparsity_info.keys()) 
+        temp_indexed_sparsity = {f"{i+1}_{name}": self.sparsity_info[name] for i, name in enumerate(sorted_layer_names)}
+
+        for key, sparsity in temp_indexed_sparsity.items():
+            try:
+                # Extract original index from the temporary key
+                idx_part = key.split('_')[0]
+                idx = int(idx_part)
+            except (ValueError, IndexError):
+                print(f"Warning: Could not parse index from key '{key}', skipping layer in logical mapping.")
+                continue
+
             # Calculate which transformer block this belongs to (0-indexed)
             block_idx = (idx - 1) // 6
             # Calculate which component within the block (0-5)
@@ -157,11 +165,13 @@ class EnhancedReportAccuracy():
             
             # Write original layer-wise sparsity
             if self.sparsity_info:
-                avg_sparsity = sum(self.sparsity_info.values()) / len(self.sparsity_info)
-                f.write(f"Average Raw Sparsity: {avg_sparsity:.6f}\n")
-                f.write("Linear Layer Sparsity (Raw):\n")
-                for layer, sparsity in self.sparsity_info.items():
-                    f.write(f"  {layer}: {sparsity:.6f}\n")
+                # Calculate average sparsity based on the stored unique layer values
+                valid_sparsities = [s for s in self.sparsity_info.values() if isinstance(s, (float, int))]
+                if valid_sparsities:
+                     avg_sparsity = sum(valid_sparsities) / len(valid_sparsities)
+                     f.write(f"Average Raw Sparsity (unique layers): {avg_sparsity:.6f}\n")
+                else:
+                    f.write("Average Raw Sparsity (unique layers): N/A\n")
             
             # Write logical layer sparsity (matching partition scheme)
             if self.logical_layers:
@@ -377,10 +387,11 @@ def evaluation(args, dataset_cfg):
                         )
                     elif prune_method == 'dsnot':
                         # DSnoT pruning
-                        print(f"Using WANDA+DSnoT pruning with keep_ratio = {keep_ratio}, max_cycles = {max_cycles}")
-                        weights = model.prune_wanda_dsnot(ubatch, keep_ratio=keep_ratio, 
-                                                         max_cycles=max_cycles, 
-                                                         error_threshold=error_threshold)
+                        print(f"Using DSnoT pruning with keep_ratio = {keep_ratio}, max_cycles = {max_cycles}")
+                        weights = model.prune_dsnot(ubatch, keep_ratio=keep_ratio, 
+                                               max_cycles=max_cycles, 
+                                               error_threshold=error_threshold,
+                                               n_m_ratio=args.nm_ratio if hasattr(args, 'nm_ratio') else None)
                     else:
                         raise ValueError(f"Unknown pruning method: {prune_method}")
                 else:
@@ -404,10 +415,11 @@ def evaluation(args, dataset_cfg):
                                                               steps=iterative_steps, mini_test_batch=mini_test_batch)
                     elif prune_method == 'dsnot':
                         # DSnoT pruning
-                        print(f"Using WANDA+DSnoT pruning with keep_ratio = {keep_ratio}, max_cycles = {max_cycles}")
-                        weights = model.prune_wanda_dsnot(ubatch, keep_ratio=keep_ratio, 
-                                                         max_cycles=max_cycles, 
-                                                         error_threshold=error_threshold)
+                        print(f"Using DSnoT pruning with keep_ratio = {keep_ratio}, max_cycles = {max_cycles}")
+                        weights = model.prune_dsnot(ubatch, keep_ratio=keep_ratio, 
+                                               max_cycles=max_cycles, 
+                                               error_threshold=error_threshold,
+                                               n_m_ratio=args.nm_ratio if hasattr(args, 'nm_ratio') else None)
                     else:
                         raise ValueError(f"Unknown pruning method: {prune_method}")
             
