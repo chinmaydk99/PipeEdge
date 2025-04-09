@@ -1,4 +1,4 @@
-"""Model configurations and default parameters."""
+"""Model configurations and default parameters for DSnoT pruning."""
 import logging
 from typing import Any, Callable, List, Optional, Tuple
 from torch.distributed import rpc as trpc
@@ -7,7 +7,7 @@ from transformers import AutoConfig
 from pipeedge.comm import p2p, rpc
 from pipeedge.models import ModuleShard, ModuleShardConfig
 from pipeedge.models.cnn import alexnet, resnet
-from pipeedge.models.transformers import bert, deit, vit_wanda
+from pipeedge.models.transformers import bert, deit, vit_dsnot
 import devices
 
 _logger = logging.getLogger(__name__)
@@ -25,21 +25,21 @@ def _model_cfg_add(name, layers, weights_file, shard_module, pruned_weights_file
 
 # Transformer blocks can be split 4 ways, e.g., where ViT-Base has 12 layers, we specify 12*4=48
 _model_cfg_add('google/vit-base-patch16-224', 48, 'ViT-B_16-224.npz',
-               vit_wanda.ViTShardForImageClassification, 'ViT-B_16-224_SNIP_pruned.npz')
+               vit_dsnot.ViTShardForImageClassification, 'ViT-B_16-224_DSnoT_pruned.npz')
 # Add version with calibration support
 _model_cfg_add('google/vit-base-patch16-224-calib', 48, 'ViT-B_16-224.npz',
-               vit_wanda.ViTShardForImageClassificationV2, 'ViT-B_16-224_WANDA_calibrated.npz')
+               vit_dsnot.ViTShardForImageClassificationV2, 'ViT-B_16-224_DSnoT_calibrated.npz')
 _model_cfg_add('google/vit-large-patch16-224', 96, 'ViT-L_16-224.npz',
-               vit_wanda.ViTShardForImageClassification)
+               vit_dsnot.ViTShardForImageClassification, 'ViT-L_16-224_DSnoT_pruned.npz')
 # Add version with calibration support
 _model_cfg_add('google/vit-large-patch16-224-calib', 96, 'ViT-L_16-224.npz',
-               vit_wanda.ViTShardForImageClassificationV2, 'ViT-L_16-224_WANDA_calibrated.npz')
+               vit_dsnot.ViTShardForImageClassificationV2, 'ViT-L_16-224_DSnoT_calibrated.npz')
 # NOTE: This ViT-Huge model doesn't include classification, so the config must be extended
 _model_cfg_add('google/vit-huge-patch14-224-in21k', 128, 'ViT-H_14.npz',
-               vit_wanda.ViTShardForImageClassification)
+               vit_dsnot.ViTShardForImageClassification, 'ViT-H_14_DSnoT_pruned.npz')
 # Add version with calibration support
 _model_cfg_add('google/vit-huge-patch14-224-in21k-calib', 128, 'ViT-H_14.npz',
-               vit_wanda.ViTShardForImageClassificationV2, 'ViT-H_14_WANDA_calibrated.npz')
+               vit_dsnot.ViTShardForImageClassificationV2, 'ViT-H_14_DSnoT_calibrated.npz')
 
 # NOTE: BertModelShard alone doesn't do classification
 _model_cfg_add('bert-base-uncased', 48, 'BERT-B.npz',
@@ -99,6 +99,10 @@ def get_model_config(model_name: str, model_file = None) -> Any:
 def get_model_default_weights_file(model_name: str) -> str:
     """Get a model's default weights file name."""
     return _MODEL_CONFIGS[model_name]['weights_file']
+
+def get_model_pruned_weights_file(model_name: str) -> str:
+    """Get a model's pruned weights file name."""
+    return _MODEL_CONFIGS[model_name]['pruned_weights_file']
 
 def save_model_weights_file(model_name: str, model_file: Optional[str]=None) -> None:
     """Save a model's weights file."""
@@ -195,4 +199,4 @@ def dist_p2p_pipeline_stage_factory(stage_ranks: List[int], data_rank: int, rank
         rank_dst = data_rank if stage == len(stage_ranks) - 1 else stage_ranks[(stage + 1)]
         work_cb = module
         results_cb = None
-    return p2p.DistP2pPipelineStage(rank_src, rank_dst, work_cb, results_cb)
+    return p2p.DistP2pPipelineStage(rank_src, rank_dst, work_cb, results_cb) 

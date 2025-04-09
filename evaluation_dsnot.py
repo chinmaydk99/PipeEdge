@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""Evaluation script for comparing WANDA vs DSnoT pruned models."""
+
+import argparse
+import logging
+import os
+import time
+from typing import Dict, List, Tuple
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+from tqdm import tqdm
+
+import model_cfg_dsnot
+import model_cfg_wanda
+from pipeedge.models import ModuleShardConfig
+import devices
+
+logger = logging.getLogger(__name__)
+
+# Default paths
+DEFAULT_DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
+DEFAULT_IMAGENET_DIR = os.path.join(DEFAULT_DATA_DIR, 'imagenet')
+DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'results')
+
+def count_parameters(model):
+    """Count the total parameters and non-zero parameters in a model."""
+    total_params = 0
+    nonzero_params = 0
+    
+    for name, param in model.named_parameters():
+        if 'weight' in name:  # Only count weights, not biases
+            param_count = param.numel()
+            total_params += param_count
+            nonzero_params += (param != 0).sum().item()
+    
+    return total_params, nonzero_params
+
+def evaluate_model(model, dataloader, device):
+    """Evaluate model accuracy on the given dataloader."""
+    model.eval()
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for inputs, targets in tqdm(dataloader, desc="Evaluating"):
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            
+            # Forward pass
+            outputs = model(inputs)
+            _, predicted = outputs.max(1)
+            
+            # Calculate accuracy
+            correct += predicted.eq(targets).sum().item()
+            total += targets.size(0)
+    
+    accuracy = 100.0 * correct / total
+    return accuracy
+
+def load_model(model_name, weights_file, device):
+    """Load a model with the specified weights."""
+    # Get model configuration
+    config = model_cfg_dsnot.get_model_config(model_name)
+    
+    # Create full model (one shard containing all layers)
+    layers = model_cfg_dsnot.get_model_layers(model_name)
+    shard_config = ModuleShardConfig(layer_start=1, layer_end=layers, 
+                                    is_first=True, is_last=True)
+    
+    # Get the appropriate model class
+    model_class = model_cfg_dsnot.get_model_dict(model_name)['shard_module']
+    
+    # Load weights correctly depending on file type
+    if isinstance(weights_file, str) and os.path.isfile(weights_file):
+        if weights_file.endswith('.pt'):
+            print(f"Loading state dict from .pt file: {weights_file}")
+            # Load the state dict from the .pt file first
+            loaded_weights = torch.load(weights_file, map_location='cpu') 
+        elif weights_file.endswith('.npz'):
+             print(f"Loading from .npz file: {weights_file}")
+             # Pass the filename directly for npz
+             loaded_weights = weights_file 
+        else:
+             raise ValueError(f"Unsupported weights file format: {weights_file}")
+    elif isinstance(weights_file, dict): # Already a state dict mapping
+         print("Loading from provided state dict mapping.")
+         loaded_weights = weights_file
+    else:
+         raise TypeError(f"Invalid weights_file type: {type(weights_file)}")
+
+    # Instantiate the model, passing the loaded state_dict mapping or npz filename
+    model = model_class(config, shard_config, loaded_weights, prune=True) 
+    model.to(device)
+    model.eval()
+    
+    return model
+
+def prepare_imagenet_dataloaders(data_dir, batch_size=64, workers=4):
+    """Prepare ImageNet validation dataloader."""
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+    
+    val_dataset = datasets.ImageFolder(
+        os.path.join(data_dir, 'val'),
+        transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize,
+        ]))
+    
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=workers, pin_memory=True)
+    
+    return val_loader
+
+def prepare_calibration_batch(val_loader, num_batches=1, device=None):
+    """Prepare a batch of data for calibration."""
+    calibration_data = []
+    for i, (inputs, _) in enumerate(val_loader):
+        if i >= num_batches:
+            break
+        if device is not None:
+            inputs = inputs.to(device)
+        calibration_data.append(inputs)
+    
+    return torch.cat(calibration_data, dim=0)
+
+def run_pruning_comparison(model_name, keep_ratio, dsnot_args, calibration_batch, device):
+    """Run and compare WANDA and DSnoT pruning methods."""
+    # Get the original model
+    original_weights_file = model_cfg_dsnot.get_model_default_weights_file(model_name)
+    original_model = load_model(model_name, original_weights_file, device)
+    
+    # Get model class for pruning - DSnoT
+    dsnot_model_class = model_cfg_dsnot.get_model_dict(model_name)['shard_module']
+    # Get model class for WANDA pruning explicitly
+    wanda_model_class = model_cfg_wanda.get_model_dict(model_name)['shard_module']
+    
+    # Setup configs (same for both)
+    config = model_cfg_dsnot.get_model_config(model_name)
+    layers = model_cfg_dsnot.get_model_layers(model_name)
+    shard_config = ModuleShardConfig(layer_start=1, layer_end=layers, 
+                                    is_first=True, is_last=True)
+    
+    # Apply WANDA pruning using the WANDA class
+    # Instantiate model using WANDA class
+    wanda_pruning_instance = wanda_model_class(config, shard_config, original_weights_file) 
+    wanda_pruning_instance.to(device)
+    wanda_pruning_instance.eval()
+    
+    print("--- Applying WANDA Pruning ---")
+    start_time = time.time()
+    # Call prune_wanda from the WANDA instance
+    wanda_weights = wanda_pruning_instance.prune_wanda(calibration_batch, keep_ratio=keep_ratio) 
+    wanda_time = time.time() - start_time
+    del wanda_pruning_instance # Free memory
+    torch.cuda.empty_cache() 
+    
+    # Create a model instance to load WANDA weights (can use DSnoT class, as loading is compatible)
+    wanda_pruned_model = dsnot_model_class(config, shard_config, wanda_weights, prune=True) 
+    wanda_pruned_model.to(device)
+    wanda_pruned_model.eval()
+    
+    # Apply DSnoT pruning using the DSnoT class
+    # Instantiate model using DSnoT class
+    dsnot_pruning_instance = dsnot_model_class(config, shard_config, original_weights_file) 
+    dsnot_pruning_instance.to(device)
+    dsnot_pruning_instance.eval()
+    
+    print("--- Applying WANDA + DSnoT Pruning ---")
+    start_time = time.time()
+    # Call prune_wanda_dsnot from the DSnoT instance
+    dsnot_weights = dsnot_pruning_instance.prune_wanda_dsnot(calibration_batch, dsnot_args, keep_ratio=keep_ratio) 
+    dsnot_time = time.time() - start_time
+    del dsnot_pruning_instance # Free memory
+    torch.cuda.empty_cache()
+    
+    # Create a model instance with DSnoT weights
+    dsnot_pruned_model = dsnot_model_class(config, shard_config, dsnot_weights, prune=True)
+    dsnot_pruned_model.to(device)
+    dsnot_pruned_model.eval()
+    
+    # Count parameters
+    original_total, original_nonzero = count_parameters(original_model)
+    wanda_total, wanda_nonzero = count_parameters(wanda_pruned_model)
+    dsnot_total, dsnot_nonzero = count_parameters(dsnot_pruned_model)
+    
+    results = {
+        'original': {
+            'total_params': original_total,
+            'nonzero_params': original_nonzero,
+            'sparsity': 1.0 - (original_nonzero / original_total),
+            'model': original_model
+        },
+        'wanda': {
+            'total_params': wanda_total,
+            'nonzero_params': wanda_nonzero,
+            'sparsity': 1.0 - (wanda_nonzero / wanda_total),
+            'pruning_time': wanda_time,
+            'model': wanda_pruned_model
+        },
+        'dsnot': {
+            'total_params': dsnot_total,
+            'nonzero_params': dsnot_nonzero,
+            'sparsity': 1.0 - (dsnot_nonzero / dsnot_total),
+            'pruning_time': dsnot_time,
+            'model': dsnot_pruned_model
+        }
+    }
+    
+    return results
+
+def save_pruned_weights(model_name, weights, method):
+    """Save pruned weights to file."""
+    if method == 'wanda':
+        output_file = model_cfg_wanda.get_model_pruned_weights_file(model_name)
+    else:  # dsnot
+        output_file = model_cfg_dsnot.get_model_pruned_weights_file(model_name)
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    
+    # Save weights
+    torch.save(weights, output_file)
+    return output_file
+
+def main():
+    parser = argparse.ArgumentParser(description='Compare WANDA and DSnoT pruning approaches.')
+    parser.add_argument('--model', type=str, default='google/vit-base-patch16-224',
+                      help='Model name (default: google/vit-base-patch16-224)')
+    parser.add_argument('--data-dir', type=str, default=DEFAULT_IMAGENET_DIR,
+                      help=f'Path to ImageNet data (default: {DEFAULT_IMAGENET_DIR})')
+    parser.add_argument('--output-dir', type=str, default=DEFAULT_OUTPUT_DIR,
+                      help=f'Output directory for results (default: {DEFAULT_OUTPUT_DIR})')
+    parser.add_argument('--batch-size', type=int, default=64,
+                      help='Evaluation batch size (default: 64)')
+    parser.add_argument('--calib-batches', type=int, default=10,
+                      help='Number of batches to use for calibration (default: 10)')
+    parser.add_argument('--keep-ratio', type=float, default=0.5,
+                      help='Ratio of weights to keep (default: 0.5)')
+    parser.add_argument('--dsnot-cycles', type=int, default=50,
+                      help='Maximum number of DSnoT refinement cycles (default: 50)')
+    parser.add_argument('--dsnot-threshold', type=float, default=0.1,
+                      help='DSnoT update threshold (default: 0.1)')
+    parser.add_argument('--evaluate-only', action='store_true',
+                      help='Only evaluate pre-pruned models, skip pruning')
+    parser.add_argument('--save-weights', action='store_true',
+                      help='Save pruned weights to disk')
+    args = parser.parse_args()
+    
+    # Setup device
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+    print(f"Using device: {device}")
+    
+    # Prepare data loaders
+    val_loader = prepare_imagenet_dataloaders(args.data_dir, args.batch_size)
+    
+    # Prepare calibration batch
+    calib_batch = prepare_calibration_batch(val_loader, args.calib_batches, device)
+    
+    # DSnoT hyperparameters
+    dsnot_args = {
+        'dsnot_cycles': args.dsnot_cycles,
+        'dsnot_threshold': args.dsnot_threshold,
+        'pow_of_var_regrowing': 1.0,
+        'without_same_sign': True
+    }
+    
+    if not args.evaluate_only:
+        # Run pruning comparison
+        results = run_pruning_comparison(
+            args.model, args.keep_ratio, dsnot_args, calib_batch, device)
+        
+        # Display initial results
+        print("\n===== Pruning Results =====")
+        print(f"Model: {args.model}")
+        print(f"Keep ratio: {args.keep_ratio}")
+        
+        print("\nOriginal model:")
+        print(f"  Total parameters: {results['original']['total_params']:,}")
+        print(f"  Non-zero parameters: {results['original']['nonzero_params']:,}")
+        print(f"  Sparsity: {results['original']['sparsity']:.4f}")
+        
+        print("\nWANDA pruned model:")
+        print(f"  Total parameters: {results['wanda']['total_params']:,}")
+        print(f"  Non-zero parameters: {results['wanda']['nonzero_params']:,}")
+        print(f"  Sparsity: {results['wanda']['sparsity']:.4f}")
+        print(f"  Pruning time: {results['wanda']['pruning_time']:.2f} seconds")
+        
+        print("\nDSnoT pruned model:")
+        print(f"  Total parameters: {results['dsnot']['total_params']:,}")
+        print(f"  Non-zero parameters: {results['dsnot']['nonzero_params']:,}")
+        print(f"  Sparsity: {results['dsnot']['sparsity']:.4f}")
+        print(f"  Pruning time: {results['dsnot']['pruning_time']:.2f} seconds")
+        
+        # Save weights if requested
+        if args.save_weights:
+            wanda_file = save_pruned_weights(args.model, results['wanda']['model'].state_dict(), 'wanda')
+            dsnot_file = save_pruned_weights(args.model, results['dsnot']['model'].state_dict(), 'dsnot')
+            print(f"\nSaved WANDA weights to: {wanda_file}")
+            print(f"Saved DSnoT weights to: {dsnot_file}")
+        
+        # Evaluate models
+        print("\n===== Evaluating Models =====")
+        
+        print("Evaluating original model...")
+        original_acc = evaluate_model(results['original']['model'], val_loader, device)
+        
+        print("Evaluating WANDA pruned model...")
+        wanda_acc = evaluate_model(results['wanda']['model'], val_loader, device)
+        
+        print("Evaluating DSnoT pruned model...")
+        dsnot_acc = evaluate_model(results['dsnot']['model'], val_loader, device)
+        
+        # Display evaluation results
+        print("\n===== Evaluation Results =====")
+        print(f"Original model accuracy: {original_acc:.2f}%")
+        print(f"WANDA pruned model accuracy: {wanda_acc:.2f}% (delta: {wanda_acc - original_acc:.2f}%)")
+        print(f"DSnoT pruned model accuracy: {dsnot_acc:.2f}% (delta: {dsnot_acc - original_acc:.2f}%)")
+        
+    else:
+        # Evaluate pre-pruned models only
+        print("\n===== Evaluating Pre-Pruned Models =====")
+        
+        # Load models
+        original_weights_file = model_cfg_dsnot.get_model_default_weights_file(args.model)
+        wanda_weights_file = model_cfg_wanda.get_model_pruned_weights_file(args.model)
+        dsnot_weights_file = model_cfg_dsnot.get_model_pruned_weights_file(args.model)
+        
+        print(f"Loading original model from: {original_weights_file}")
+        original_model = load_model(args.model, original_weights_file, device)
+        
+        print(f"Loading WANDA pruned model from: {wanda_weights_file}")
+        wanda_model = load_model(args.model, wanda_weights_file, device)
+        
+        print(f"Loading DSnoT pruned model from: {dsnot_weights_file}")
+        dsnot_model = load_model(args.model, dsnot_weights_file, device)
+        
+        # Count parameters
+        original_total, original_nonzero = count_parameters(original_model)
+        wanda_total, wanda_nonzero = count_parameters(wanda_model)
+        dsnot_total, dsnot_nonzero = count_parameters(dsnot_model)
+        
+        # Display parameter counts
+        print("\n===== Parameter Counts =====")
+        print("Original model:")
+        print(f"  Total parameters: {original_total:,}")
+        print(f"  Non-zero parameters: {original_nonzero:,}")
+        print(f"  Sparsity: {1.0 - (original_nonzero / original_total):.4f}")
+        
+        print("\nWANDA pruned model:")
+        print(f"  Total parameters: {wanda_total:,}")
+        print(f"  Non-zero parameters: {wanda_nonzero:,}")
+        print(f"  Sparsity: {1.0 - (wanda_nonzero / wanda_total):.4f}")
+        
+        print("\nDSnoT pruned model:")
+        print(f"  Total parameters: {dsnot_total:,}")
+        print(f"  Non-zero parameters: {dsnot_nonzero:,}")
+        print(f"  Sparsity: {1.0 - (dsnot_nonzero / dsnot_total):.4f}")
+        
+        # Evaluate models
+        print("\n===== Evaluating Models =====")
+        
+        print("Evaluating original model...")
+        original_acc = evaluate_model(original_model, val_loader, device)
+        
+        print("Evaluating WANDA pruned model...")
+        wanda_acc = evaluate_model(wanda_model, val_loader, device)
+        
+        print("Evaluating DSnoT pruned model...")
+        dsnot_acc = evaluate_model(dsnot_model, val_loader, device)
+        
+        # Display evaluation results
+        print("\n===== Evaluation Results =====")
+        print(f"Original model accuracy: {original_acc:.2f}%")
+        print(f"WANDA pruned model accuracy: {wanda_acc:.2f}% (delta: {wanda_acc - original_acc:.2f}%)")
+        print(f"DSnoT pruned model accuracy: {dsnot_acc:.2f}% (delta: {dsnot_acc - original_acc:.2f}%)")
+
+if __name__ == "__main__":
+    main() 
