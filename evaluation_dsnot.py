@@ -18,6 +18,7 @@ import model_cfg_dsnot
 import model_cfg_wanda
 from pipeedge.models import ModuleShardConfig
 import devices
+from runtime import forward_hook_quant_encode, forward_pre_hook_quant_decode
 
 logger = logging.getLogger(__name__)
 
@@ -61,43 +62,137 @@ def evaluate_model(model, dataloader, device):
     accuracy = 100.0 * correct / total
     return accuracy
 
-def load_model(model_name, weights_file, device):
+def load_model(model_name, weights_file, device, partition=None):
     """Load a model with the specified weights."""
     # Get model configuration
     config = model_cfg_dsnot.get_model_config(model_name)
     
     # Create full model (one shard containing all layers)
     layers = model_cfg_dsnot.get_model_layers(model_name)
-    shard_config = ModuleShardConfig(layer_start=1, layer_end=layers, 
-                                    is_first=True, is_last=True)
     
-    # Get the appropriate model class
-    model_class = model_cfg_dsnot.get_model_dict(model_name)['shard_module']
-    
-    # Load weights correctly depending on file type
-    if isinstance(weights_file, str) and os.path.isfile(weights_file):
-        if weights_file.endswith('.pt'):
-            print(f"Loading state dict from .pt file: {weights_file}")
-            # Load the state dict from the .pt file first
-            loaded_weights = torch.load(weights_file, map_location='cpu') 
-        elif weights_file.endswith('.npz'):
-             print(f"Loading from .npz file: {weights_file}")
-             # Pass the filename directly for npz
-             loaded_weights = weights_file 
-        else:
-             raise ValueError(f"Unsupported weights file format: {weights_file}")
-    elif isinstance(weights_file, dict): # Already a state dict mapping
-         print("Loading from provided state dict mapping.")
-         loaded_weights = weights_file
+    # If partition is specified, use it to create sharded model
+    if partition:
+        parts = [int(i) for i in partition.split(',')]
+        assert len(parts) % 2 == 0, "Partition must have an even number of elements"
+        stage_layers = [(parts[i], parts[i+1]) for i in range(0, len(parts), 2)]
+        model_shards = []
+        
+        for i, (layer_start, layer_end) in enumerate(stage_layers):
+            is_first = i == 0
+            is_last = i == len(stage_layers) - 1
+            shard_config = ModuleShardConfig(layer_start=layer_start, layer_end=layer_end,
+                                          is_first=is_first, is_last=is_last)
+            
+            # Get the appropriate model class
+            model_class = model_cfg_dsnot.get_model_dict(model_name)['shard_module']
+            
+            # Load weights
+            if isinstance(weights_file, str) and os.path.isfile(weights_file):
+                if weights_file.endswith('.pt'):
+                    print(f"Loading state dict from .pt file: {weights_file}")
+                    loaded_weights = torch.load(weights_file, map_location='cpu')
+                elif weights_file.endswith('.npz'):
+                    print(f"Loading from .npz file: {weights_file}")
+                    loaded_weights = weights_file
+                else:
+                    raise ValueError(f"Unsupported weights file format: {weights_file}")
+            elif isinstance(weights_file, dict):
+                print("Loading from provided state dict mapping.")
+                loaded_weights = weights_file
+            else:
+                raise TypeError(f"Invalid weights_file type: {type(weights_file)}")
+            
+            # Instantiate shard
+            shard = model_class(config, shard_config, loaded_weights, prune=True)
+            shard.to(device)
+            shard.eval()
+            model_shards.append(shard)
+        
+        # Return model shards for partitioned execution
+        return model_shards
     else:
-         raise TypeError(f"Invalid weights_file type: {type(weights_file)}")
-
-    # Instantiate the model, passing the loaded state_dict mapping or npz filename
-    model = model_class(config, shard_config, loaded_weights, prune=True) 
-    model.to(device)
-    model.eval()
+        # Create single shard containing all layers (original behavior)
+        shard_config = ModuleShardConfig(layer_start=1, layer_end=layers, 
+                                      is_first=True, is_last=True)
+        
+        # Get the appropriate model class
+        model_class = model_cfg_dsnot.get_model_dict(model_name)['shard_module']
+        
+        # Load weights correctly depending on file type
+        if isinstance(weights_file, str) and os.path.isfile(weights_file):
+            if weights_file.endswith('.pt'):
+                print(f"Loading state dict from .pt file: {weights_file}")
+                loaded_weights = torch.load(weights_file, map_location='cpu') 
+            elif weights_file.endswith('.npz'):
+                 print(f"Loading from .npz file: {weights_file}")
+                 loaded_weights = weights_file 
+            else:
+                 raise ValueError(f"Unsupported weights file format: {weights_file}")
+        elif isinstance(weights_file, dict):
+             print("Loading from provided state dict mapping.")
+             loaded_weights = weights_file
+        else:
+             raise TypeError(f"Invalid weights_file type: {type(weights_file)}")
     
-    return model
+        # Instantiate the model, passing the loaded state_dict mapping or npz filename
+        model = model_class(config, shard_config, loaded_weights, prune=True) 
+        model.to(device)
+        model.eval()
+        
+        return model
+
+def _forward_model(input_tensor, model_shards, quant=None):
+    """Forward pass through partitioned model."""
+    num_shards = len(model_shards)
+    if not isinstance(model_shards, list):
+        # Single model case
+        return model_shards(input_tensor)
+    
+    # Handle partitioned model case
+    temp_tensor = input_tensor
+    for idx in range(num_shards):
+        shard = model_shards[idx]
+
+        # decoder (if using quantization)
+        if quant and idx != 0:
+            temp_tensor = forward_pre_hook_quant_decode(shard, temp_tensor)
+
+        # forward
+        if isinstance(temp_tensor, tuple) and len(temp_tensor) > 0:
+            if isinstance(temp_tensor[0], tuple) and len(temp_tensor[0]) == 2:
+                temp_tensor = temp_tensor[0]
+            elif isinstance(temp_tensor[0], torch.Tensor):
+                temp_tensor = temp_tensor[0]
+        temp_tensor = shard(temp_tensor)
+
+        # encoder (if using quantization)
+        if quant and idx != num_shards-1:
+            temp_tensor = (forward_hook_quant_encode(shard, None, temp_tensor),)
+            
+    return temp_tensor
+
+def evaluate_partitioned_model(model_shards, dataloader, device, quant=None):
+    """Evaluate accuracy of a partitioned model."""
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for inputs, targets in tqdm(dataloader, desc="Evaluating"):
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            
+            # Forward pass through partitioned model
+            outputs = _forward_model(inputs, model_shards, quant)
+            
+            # Get predictions
+            _, predicted = outputs.max(1)
+            
+            # Calculate accuracy
+            correct += predicted.eq(targets).sum().item()
+            total += targets.size(0)
+    
+    accuracy = 100.0 * correct / total
+    return accuracy
 
 def prepare_imagenet_dataloaders(data_dir, batch_size=64, workers=4):
     """Prepare ImageNet validation dataloader."""
@@ -196,21 +291,24 @@ def run_pruning_comparison(model_name, keep_ratio, dsnot_args, calibration_batch
             'total_params': original_total,
             'nonzero_params': original_nonzero,
             'sparsity': 1.0 - (original_nonzero / original_total),
-            'model': original_model
+            'model': original_model,
+            'weights': original_weights_file
         },
         'wanda': {
             'total_params': wanda_total,
             'nonzero_params': wanda_nonzero,
             'sparsity': 1.0 - (wanda_nonzero / wanda_total),
             'pruning_time': wanda_time,
-            'model': wanda_pruned_model
+            'model': wanda_pruned_model,
+            'weights': wanda_weights
         },
         'dsnot': {
             'total_params': dsnot_total,
             'nonzero_params': dsnot_nonzero,
             'sparsity': 1.0 - (dsnot_nonzero / dsnot_total),
             'pruning_time': dsnot_time,
-            'model': dsnot_pruned_model
+            'model': dsnot_pruned_model,
+            'weights': dsnot_weights
         }
     }
     
@@ -230,28 +328,56 @@ def save_pruned_weights(model_name, weights, method):
     torch.save(weights, output_file)
     return output_file
 
+def _get_default_quant(n_stages: int) -> List[int]:
+    """Get default quantization settings (0 = no quantization)."""
+    return [0] * n_stages
+
 def main():
     parser = argparse.ArgumentParser(description='Compare WANDA and DSnoT pruning approaches.')
+    # Model options
     parser.add_argument('--model', type=str, default='google/vit-base-patch16-224',
                       help='Model name (default: google/vit-base-patch16-224)')
     parser.add_argument('--data-dir', type=str, default=DEFAULT_IMAGENET_DIR,
                       help=f'Path to ImageNet data (default: {DEFAULT_IMAGENET_DIR})')
     parser.add_argument('--output-dir', type=str, default=DEFAULT_OUTPUT_DIR,
                       help=f'Output directory for results (default: {DEFAULT_OUTPUT_DIR})')
+    
+    # Batch size options
     parser.add_argument('--batch-size', type=int, default=64,
                       help='Evaluation batch size (default: 64)')
+    parser.add_argument('-tb', '--train-batch-size', type=int, default=64,
+                      help='Training batch size for pruning (default: 64)')
     parser.add_argument('--calib-batches', type=int, default=10,
                       help='Number of batches to use for calibration (default: 10)')
+    
+    # Pruning options
+    parser.add_argument('--prune', type=bool, nargs='?', const=True, default=False,
+                      help='Whether to perform pruning (default: False)')
     parser.add_argument('--keep-ratio', type=float, default=0.5,
                       help='Ratio of weights to keep (default: 0.5)')
+    
+    # DSnoT options
     parser.add_argument('--dsnot-cycles', type=int, default=50,
                       help='Maximum number of DSnoT refinement cycles (default: 50)')
     parser.add_argument('--dsnot-threshold', type=float, default=0.1,
                       help='DSnoT update threshold (default: 0.1)')
+    
+    # Partitioning options
+    parser.add_argument('--partition', type=str, default=None,
+                      help='Comma-delimited list of start/end layer pairs, e.g.: "1,24,25,48"')
+    parser.add_argument('-q', '--quant', type=str, default=None,
+                      help='Comma-delimited list of quantization bits to use after each stage')
+    
+    # Other options
     parser.add_argument('--evaluate-only', action='store_true',
                       help='Only evaluate pre-pruned models, skip pruning')
     parser.add_argument('--save-weights', action='store_true',
                       help='Save pruned weights to disk')
+    parser.add_argument('--stop-at-batch', type=int, default=None,
+                      help='The number of batches to stop evaluation (default: None)')
+    parser.add_argument('--num-workers', type=int, default=4,
+                      help='Number of dataloader workers (default: 4)')
+                      
     args = parser.parse_args()
     
     # Setup device
@@ -262,10 +388,17 @@ def main():
     print(f"Using device: {device}")
     
     # Prepare data loaders
-    val_loader = prepare_imagenet_dataloaders(args.data_dir, args.batch_size)
+    val_loader = prepare_imagenet_dataloaders(args.data_dir, args.batch_size, args.num_workers)
     
     # Prepare calibration batch
     calib_batch = prepare_calibration_batch(val_loader, args.calib_batches, device)
+    
+    # Setup quantization if specified
+    quant_values = None
+    if args.partition and args.quant:
+        parts = [int(i) for i in args.partition.split(',')]
+        num_shards = len(parts)//2
+        quant_values = [int(i) for i in args.quant.split(',')] if args.quant else _get_default_quant(num_shards)
     
     # DSnoT hyperparameters
     dsnot_args = {
@@ -275,7 +408,7 @@ def main():
         'without_same_sign': True
     }
     
-    if not args.evaluate_only:
+    if args.prune and not args.evaluate_only:
         # Run pruning comparison
         results = run_pruning_comparison(
             args.model, args.keep_ratio, dsnot_args, calib_batch, device)
@@ -304,22 +437,43 @@ def main():
         
         # Save weights if requested
         if args.save_weights:
-            wanda_file = save_pruned_weights(args.model, results['wanda']['model'].state_dict(), 'wanda')
-            dsnot_file = save_pruned_weights(args.model, results['dsnot']['model'].state_dict(), 'dsnot')
-            print(f"\nSaved WANDA weights to: {wanda_file}")
-            print(f"Saved DSnoT weights to: {dsnot_file}")
+            if isinstance(results['wanda']['weights'], dict):
+                wanda_file = save_pruned_weights(args.model, results['wanda']['weights'], 'wanda')
+                print(f"\nSaved WANDA weights to: {wanda_file}")
+            
+            if isinstance(results['dsnot']['weights'], dict):
+                dsnot_file = save_pruned_weights(args.model, results['dsnot']['weights'], 'dsnot')
+                print(f"Saved DSnoT weights to: {dsnot_file}")
         
-        # Evaluate models
-        print("\n===== Evaluating Models =====")
-        
-        print("Evaluating original model...")
-        original_acc = evaluate_model(results['original']['model'], val_loader, device)
-        
-        print("Evaluating WANDA pruned model...")
-        wanda_acc = evaluate_model(results['wanda']['model'], val_loader, device)
-        
-        print("Evaluating DSnoT pruned model...")
-        dsnot_acc = evaluate_model(results['dsnot']['model'], val_loader, device)
+        # Partition models if partitioning is specified
+        if args.partition:
+            print("\n===== Partitioning Models =====")
+            # Load models with partitioning
+            original_model = load_model(args.model, results['original']['weights'], device, args.partition)
+            wanda_model = load_model(args.model, results['wanda']['weights'], device, args.partition)
+            dsnot_model = load_model(args.model, results['dsnot']['weights'], device, args.partition)
+            
+            # Evaluate partitioned models
+            print("\n===== Evaluating Partitioned Models =====")
+            print("Evaluating original partitioned model...")
+            original_acc = evaluate_partitioned_model(original_model, val_loader, device, quant_values)
+            
+            print("Evaluating WANDA pruned partitioned model...")
+            wanda_acc = evaluate_partitioned_model(wanda_model, val_loader, device, quant_values)
+            
+            print("Evaluating DSnoT pruned partitioned model...")
+            dsnot_acc = evaluate_partitioned_model(dsnot_model, val_loader, device, quant_values)
+        else:
+            # Evaluate non-partitioned models
+            print("\n===== Evaluating Models =====")
+            print("Evaluating original model...")
+            original_acc = evaluate_model(results['original']['model'], val_loader, device)
+            
+            print("Evaluating WANDA pruned model...")
+            wanda_acc = evaluate_model(results['wanda']['model'], val_loader, device)
+            
+            print("Evaluating DSnoT pruned model...")
+            dsnot_acc = evaluate_model(results['dsnot']['model'], val_loader, device)
         
         # Display evaluation results
         print("\n===== Evaluation Results =====")
@@ -331,53 +485,77 @@ def main():
         # Evaluate pre-pruned models only
         print("\n===== Evaluating Pre-Pruned Models =====")
         
-        # Load models
+        # Get weight file paths
         original_weights_file = model_cfg_dsnot.get_model_default_weights_file(args.model)
         wanda_weights_file = model_cfg_wanda.get_model_pruned_weights_file(args.model)
         dsnot_weights_file = model_cfg_dsnot.get_model_pruned_weights_file(args.model)
         
-        print(f"Loading original model from: {original_weights_file}")
-        original_model = load_model(args.model, original_weights_file, device)
-        
-        print(f"Loading WANDA pruned model from: {wanda_weights_file}")
-        wanda_model = load_model(args.model, wanda_weights_file, device)
-        
-        print(f"Loading DSnoT pruned model from: {dsnot_weights_file}")
-        dsnot_model = load_model(args.model, dsnot_weights_file, device)
-        
-        # Count parameters
-        original_total, original_nonzero = count_parameters(original_model)
-        wanda_total, wanda_nonzero = count_parameters(wanda_model)
-        dsnot_total, dsnot_nonzero = count_parameters(dsnot_model)
-        
-        # Display parameter counts
-        print("\n===== Parameter Counts =====")
-        print("Original model:")
-        print(f"  Total parameters: {original_total:,}")
-        print(f"  Non-zero parameters: {original_nonzero:,}")
-        print(f"  Sparsity: {1.0 - (original_nonzero / original_total):.4f}")
-        
-        print("\nWANDA pruned model:")
-        print(f"  Total parameters: {wanda_total:,}")
-        print(f"  Non-zero parameters: {wanda_nonzero:,}")
-        print(f"  Sparsity: {1.0 - (wanda_nonzero / wanda_total):.4f}")
-        
-        print("\nDSnoT pruned model:")
-        print(f"  Total parameters: {dsnot_total:,}")
-        print(f"  Non-zero parameters: {dsnot_nonzero:,}")
-        print(f"  Sparsity: {1.0 - (dsnot_nonzero / dsnot_total):.4f}")
-        
-        # Evaluate models
-        print("\n===== Evaluating Models =====")
-        
-        print("Evaluating original model...")
-        original_acc = evaluate_model(original_model, val_loader, device)
-        
-        print("Evaluating WANDA pruned model...")
-        wanda_acc = evaluate_model(wanda_model, val_loader, device)
-        
-        print("Evaluating DSnoT pruned model...")
-        dsnot_acc = evaluate_model(dsnot_model, val_loader, device)
+        if args.partition:
+            # Load models with partitioning
+            print(f"Loading original partitioned model from: {original_weights_file}")
+            original_model = load_model(args.model, original_weights_file, device, args.partition)
+            
+            print(f"Loading WANDA pruned partitioned model from: {wanda_weights_file}")
+            wanda_model = load_model(args.model, wanda_weights_file, device, args.partition)
+            
+            print(f"Loading DSnoT pruned partitioned model from: {dsnot_weights_file}")
+            dsnot_model = load_model(args.model, dsnot_weights_file, device, args.partition)
+            
+            # Evaluate partitioned models
+            print("\n===== Evaluating Partitioned Models =====")
+            
+            print("Evaluating original partitioned model...")
+            original_acc = evaluate_partitioned_model(original_model, val_loader, device, quant_values)
+            
+            print("Evaluating WANDA pruned partitioned model...")
+            wanda_acc = evaluate_partitioned_model(wanda_model, val_loader, device, quant_values)
+            
+            print("Evaluating DSnoT pruned partitioned model...")
+            dsnot_acc = evaluate_partitioned_model(dsnot_model, val_loader, device, quant_values)
+        else:
+            # Load models without partitioning
+            print(f"Loading original model from: {original_weights_file}")
+            original_model = load_model(args.model, original_weights_file, device)
+            
+            print(f"Loading WANDA pruned model from: {wanda_weights_file}")
+            wanda_model = load_model(args.model, wanda_weights_file, device)
+            
+            print(f"Loading DSnoT pruned model from: {dsnot_weights_file}")
+            dsnot_model = load_model(args.model, dsnot_weights_file, device)
+            
+            # Count parameters (only works properly on non-partitioned models)
+            original_total, original_nonzero = count_parameters(original_model)
+            wanda_total, wanda_nonzero = count_parameters(wanda_model)
+            dsnot_total, dsnot_nonzero = count_parameters(dsnot_model)
+            
+            # Display parameter counts
+            print("\n===== Parameter Counts =====")
+            print("Original model:")
+            print(f"  Total parameters: {original_total:,}")
+            print(f"  Non-zero parameters: {original_nonzero:,}")
+            print(f"  Sparsity: {1.0 - (original_nonzero / original_total):.4f}")
+            
+            print("\nWANDA pruned model:")
+            print(f"  Total parameters: {wanda_total:,}")
+            print(f"  Non-zero parameters: {wanda_nonzero:,}")
+            print(f"  Sparsity: {1.0 - (wanda_nonzero / wanda_total):.4f}")
+            
+            print("\nDSnoT pruned model:")
+            print(f"  Total parameters: {dsnot_total:,}")
+            print(f"  Non-zero parameters: {dsnot_nonzero:,}")
+            print(f"  Sparsity: {1.0 - (dsnot_nonzero / dsnot_total):.4f}")
+            
+            # Evaluate models
+            print("\n===== Evaluating Models =====")
+            
+            print("Evaluating original model...")
+            original_acc = evaluate_model(original_model, val_loader, device)
+            
+            print("Evaluating WANDA pruned model...")
+            wanda_acc = evaluate_model(wanda_model, val_loader, device)
+            
+            print("Evaluating DSnoT pruned model...")
+            dsnot_acc = evaluate_model(dsnot_model, val_loader, device)
         
         # Display evaluation results
         print("\n===== Evaluation Results =====")
