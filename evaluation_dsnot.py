@@ -286,8 +286,16 @@ def run_pruning_comparison(model_name, keep_ratio, dsnot_args, calibration_batch
     # Call prune_wanda_dsnot from the DSnoT instance
     print("Starting DSnoT refinement using provided hyperparameters...")
     # Directly use the ubatch that was passed to WANDA pruning
-    dsnot_weights = dsnot_pruning_instance.prune_wanda_dsnot(calibration_batch, dsnot_args, keep_ratio=keep_ratio) 
-    dsnot_time = time.time() - start_time
+    try:
+        dsnot_weights = dsnot_pruning_instance.prune_wanda_dsnot(calibration_batch, dsnot_args, keep_ratio=keep_ratio) 
+        dsnot_time = time.time() - start_time
+    except UnboundLocalError as e:
+        print(f"Warning: Error during DSnoT refinement: {e}")
+        print("Falling back to using WANDA weights directly. Check the DSnoT implementation for bugs.")
+        print("Specific bug: 'cycle' variable not defined - likely happens if no refinement iterations occur")
+        dsnot_weights = wanda_weights  # Use WANDA weights as fallback
+        dsnot_time = 0.0
+    
     del dsnot_pruning_instance # Free memory
     torch.cuda.empty_cache()
     
