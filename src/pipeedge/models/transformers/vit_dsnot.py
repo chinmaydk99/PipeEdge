@@ -820,23 +820,43 @@ class ViTShardForImageClassification(ModuleShard):
                     # Convergence Check
                     error_after_swap = reconstruction_error[active_rows_final] + prune_metric.unsqueeze(1) - grow_metric.unsqueeze(1)
                     error_after_swap.nan_to_num_(nan=0.0) # Handle potential NaNs from metrics
-                    sign_check = (initialize_error_sign[active_rows_final] == torch.sign(error_after_swap))
-                    threshold_check = (torch.abs(reconstruction_error[active_rows_final]) > error_threshold)
-                    rows_to_update_mask = sign_check & threshold_check
-                    if not rows_to_update_mask.any(): break
-
-                    # Perform Swap and Update Error
-                    active_update_rows = active_rows_final[rows_to_update_mask]
-                    active_grow_idx = grow_idx_final[rows_to_update_mask]
-                    active_prune_idx = prune_idx_final[rows_to_update_mask]
-                    current_mask[active_update_rows, active_grow_idx] = True
-                    current_mask[active_update_rows, active_prune_idx] = False
-                    update_error_delta = (prune_metric[rows_to_update_mask] - grow_metric[rows_to_update_mask]).unsqueeze(1)
+                    
+                    # Fix boolean ambiguity issues when comparing tensor values
+                    sign_check_tensor = (initialize_error_sign[active_rows_final] == torch.sign(error_after_swap))
+                    threshold_check_tensor = (torch.abs(reconstruction_error[active_rows_final]) > error_threshold)
+                    
+                    # Process each row individually to avoid boolean tensor ambiguity
+                    rows_to_update = torch.zeros_like(sign_check_tensor, dtype=torch.bool)
+                    for i in range(sign_check_tensor.size(0)):
+                        # Use item() to convert tensor values to scalars for boolean operations
+                        if sign_check_tensor[i].item() and threshold_check_tensor[i].item():
+                            rows_to_update[i] = True
+                    
+                    # Check if any rows should be updated
+                    if not rows_to_update.any():
+                        break
+                        
+                    # Get indices of rows to update
+                    update_indices = torch.where(rows_to_update)[0]
+                    active_update_rows = active_rows_final[update_indices]
+                    active_grow_idx = grow_idx_final[update_indices]
+                    active_prune_idx = prune_idx_final[update_indices]
+                    
+                    # Apply updates to mask
+                    for i, row_idx in enumerate(active_update_rows):
+                        # Use scalar indexing with .item() to avoid tensor boolean ambiguity
+                        current_mask[row_idx, active_grow_idx[i].item()] = True
+                        current_mask[row_idx, active_prune_idx[i].item()] = False
+                    
+                    # Update reconstruction error
+                    update_error_delta = (prune_metric[update_indices] - grow_metric[update_indices]).unsqueeze(1)
                     reconstruction_error[active_update_rows] += update_error_delta
 
                     # Deactivate rows that didn't update
                     temp_update_mask = torch.zeros_like(update_mask, dtype=torch.bool)
-                    temp_update_mask[active_update_rows] = True
+                    for row_idx in active_update_rows:
+                        # Convert to scalar with .item() to avoid tensor boolean ambiguity
+                        temp_update_mask[row_idx.item()] = True
                     update_mask = update_mask & temp_update_mask
 
                 # ---- End of DSnoT Cycle Loop ----
