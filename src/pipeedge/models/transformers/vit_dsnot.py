@@ -776,7 +776,8 @@ class ViTShardForImageClassification(ModuleShard):
                             candidate_ptr = ptr + direction * search_offset
                             if 0 <= candidate_ptr < cols:
                                 candidate_idx = grow_indices_sorted[row_idx, candidate_ptr]
-                                if not current_mask[row_idx, candidate_idx]:
+                                # Fix boolean ambiguity: use item() to convert tensor to scalar
+                                if not current_mask[row_idx, candidate_idx].item():
                                     grow_idx[k] = candidate_idx
                                     grow_idx_pointers[row_idx, grow_pointer_idx[k]] = candidate_ptr + direction
                                     found = True
@@ -795,7 +796,8 @@ class ViTShardForImageClassification(ModuleShard):
                             candidate_ptr = ptr + search_offset
                             if candidate_ptr < cols:
                                 candidate_idx = prune_indices_sorted[row_idx, candidate_ptr]
-                                if current_mask[row_idx, candidate_idx] and prune_scores_masked[row_idx, candidate_idx] != float('inf'):
+                                # Fix boolean ambiguity: use item() to convert tensor to scalar
+                                if current_mask[row_idx, candidate_idx].item() and prune_scores_masked[row_idx, candidate_idx] != float('inf'):
                                     prune_idx[k] = candidate_idx
                                     prune_idx_pointer[row_idx] = candidate_ptr + 1
                                     found = True

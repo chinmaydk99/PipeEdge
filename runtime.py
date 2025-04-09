@@ -90,7 +90,7 @@ def forward_hook_quant_encode(module, _input_arg, output: Union[torch.Tensor, Tu
     if isinstance(output, torch.Tensor):
         output = (output,)
     assert isinstance(output, tuple)
-    quant_bit = module.quant_bit.item()
+    quant_bit = module.quant_bits.item()
     comm_tuple = []
     for tensor in output:
         assert isinstance(tensor, torch.Tensor)
