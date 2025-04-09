@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 
 # Default paths
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
-DEFAULT_IMAGENET_DIR = os.path.join(DEFAULT_DATA_DIR, 'imagenet')
+# DEFAULT_IMAGENET_DIR = os.path.join(DEFAULT_DATA_DIR, 'imagenet') # Incorrect default
+DEFAULT_IMAGENET_DIR = "/project/jpwalter_148/hnwang/datasets/ImageNet/" # Correct default from evaluation_wanda.py
 DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'results')
 
 def count_parameters(model):
