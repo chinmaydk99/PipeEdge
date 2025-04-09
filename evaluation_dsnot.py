@@ -554,11 +554,12 @@ def evaluation(args, dataset_cfg):
 if __name__ == '__main__':
     # Argument parsing setup
     parser = argparse.ArgumentParser(description='PipeEdge Evaluation with DSnoT Pruning')
-    parser.add_argument('--model-name', type=str, required=True,
+    parser.add_argument('--model-name', type=str, # required=True, # Make optional
                         choices=model_cfg_dsnot.get_model_names(),
+                        default='google/vit-base-patch16-224-dsnot', # Add default
                         help='Model name (must be a DSnoT variant, e.g., google/vit-base-patch16-224-dsnot)')
-    parser.add_argument('--dataset-root', type=str, default='/datasets/imagenet/val',
-                        help='Dataset root directory (default: /datasets/imagenet/val)')
+    parser.add_argument('--dataset-root', type=str, default='/project/jpwalter_148/hnwang/datasets/ImageNet/', # Add default
+                        help='Dataset root directory (default: /project/jpwalter_148/hnwang/datasets/ImageNet/)')
     parser.add_argument('--dataset-split', type=str, default='val', choices=['val', 'train'],
                         help='Dataset split (default: val)')
     parser.add_argument('--partition', type=str, default='1',
