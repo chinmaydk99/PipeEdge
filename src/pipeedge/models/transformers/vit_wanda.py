@@ -518,6 +518,209 @@ class ViTShardForImageClassification(ModuleShard):
         # Return final weights
         return weights
     
+    def prune_wanda_dsnot(self, ubatch, keep_ratio=0.5, max_cycles=50, error_threshold=0.1):
+        """
+        Apply WANDA pruning followed by Dynamic Sparse No Training (DSnoT) for improved accuracy.
+        
+        DSnoT is a training-free fine-tuning approach that optimizes sparse masks through
+        iterative weight pruning-and-growing to minimize reconstruction error between dense
+        and sparse models, without any weight updates. This helps maintain accuracy at high 
+        sparsity levels.
+        
+        Implementation based on the paper:
+        "Dynamic Sparse No Training: Training-Free Fine-Tuning for Sparse LLMs"
+        Zhang et al., ICLR 2024
+        
+        Args:
+            ubatch: Batch of input data for calibration (determines activation patterns)
+            keep_ratio: Percentage of weights to keep (0-1)
+            max_cycles: Maximum pruning-growing cycles per row
+            error_threshold: Threshold for early stopping of iterations
+            
+        Returns:
+            Dictionary of pruned weights after DSnoT optimization
+        """
+        print(f"Starting WANDA+DSnoT pruning with keep_ratio: {keep_ratio}")
+        
+        # Step 1: Apply standard WANDA pruning first to get initial sparse model
+        weights = self.prune_wanda(ubatch, keep_ratio)
+        
+        # Create a copy of the sparse model
+        sparse_model = copy.deepcopy(self)
+        sparse_model.load_state_dict(weights)
+        
+        # Create a copy of the dense model as reference
+        dense_model = copy.deepcopy(self)
+        
+        # Extract device
+        device = next(self.parameters()).device
+        
+        print("Applying DSnoT training-free fine-tuning...")
+        
+        # Process each linear layer in the model
+        for name, module in sparse_model.named_modules():
+            if not isinstance(module, nn.Linear):
+                continue
+                
+            print(f"Optimizing layer: {name}")
+            
+            # Get corresponding dense module
+            dense_module = None
+            for dense_name, dense_mod in dense_model.named_modules():
+                if dense_name == name:
+                    dense_module = dense_mod
+                    break
+                    
+            if dense_module is None:
+                print(f"Could not find matching dense layer for {name}, skipping")
+                continue
+                
+            # Get weights and create mask
+            W = module.weight.data
+            W_dense = dense_module.weight.data
+            mask = (W != 0).float()  # Current binary mask
+            
+            # Calculate activations for this layer
+            activation_stats = {}
+            
+            def get_activation(name):
+                def hook(model, input, output):
+                    # Store input activations - handle tuple input case
+                    if isinstance(input, tuple):
+                        input = input[0]
+                    activation_stats[name] = input.detach()
+                return hook
+            
+            # Register hooks to get layer activations
+            handle = module.register_forward_hook(get_activation(name))
+            
+            # Forward pass with calibration data
+            with torch.no_grad():
+                _ = sparse_model(ubatch)
+                
+            # Remove hook
+            handle.remove()
+            
+            # Check if activations were captured
+            if name not in activation_stats:
+                print(f"No activation captured for {name}, skipping")
+                continue
+                
+            activations = activation_stats[name]
+            
+            # Reshape activations if needed
+            if activations.dim() >= 3:
+                # For attention layers: [batch_size, seq_len, hidden_dim]
+                # Reshape to [batch_size * seq_len, hidden_dim]
+                act_reshaped = activations.reshape(-1, activations.size(-1))
+                activations = act_reshaped
+            
+            # Process each output neuron (row) independently
+            for r in range(W.size(0)):
+                # Calculate initial reconstruction error
+                W_r = W_dense[r]  # [input_dim]
+                W_sparse_r = W[r]  # [input_dim]
+                mask_r = mask[r]   # [input_dim]
+                
+                # Dense output for this neuron
+                dense_out = torch.matmul(activations, W_r)  # [batch_size]
+                
+                # Sparse output for this neuron
+                sparse_out = torch.matmul(activations, W_sparse_r)  # [batch_size]
+                
+                # Initial reconstruction error
+                delta_r = dense_out - sparse_out  # [batch_size]
+                
+                # Iterative pruning and growing
+                for t in range(max_cycles):
+                    # Calculate statistics needed for growing and pruning decisions
+                    # Expected value of activations across batch
+                    E_A = torch.mean(activations, dim=0)  # [input_dim]
+                    
+                    # Variance of activations
+                    Var_A = torch.var(activations, dim=0) + 1e-8  # [input_dim] (add small epsilon to avoid division by zero)
+                    
+                    # Expected error
+                    E_delta = torch.mean(delta_r)
+                    
+                    # Growing: Find weight to revive based on DSnoT criterion
+                    if E_delta > 0:
+                        # For positive error, max value decreases error most
+                        scores = (~mask_r.bool()) * W_r * E_A / Var_A
+                        grow_idx = torch.argmax(scores).item()
+                    else:
+                        # For negative error, min value decreases error most
+                        scores = (~mask_r.bool()) * W_r * E_A / Var_A
+                        grow_idx = torch.argmin(scores).item()
+                    
+                    # Pruning: Find weight to remove based on modified Wanda criterion
+                    # While also considering reconstruction error impact
+                    if E_delta > 0:
+                        # Need to prune weights that contribute negatively to error
+                        prune_condition = (W_r * E_A < 0) & mask_r.bool()
+                        if prune_condition.any():
+                            # Consider both Wanda score and error contribution
+                            wanda_scores = torch.abs(W_r) * torch.norm(activations, dim=0)
+                            prune_scores = mask_r * wanda_scores
+                            # Only consider weights that satisfy our condition
+                            prune_scores[~prune_condition] = float('inf')
+                            prune_idx = torch.argmin(prune_scores).item()
+                        else:
+                            # Fallback to standard Wanda if no weights meet condition
+                            wanda_scores = torch.abs(W_r) * torch.norm(activations, dim=0)
+                            prune_scores = mask_r * wanda_scores
+                            prune_idx = torch.argmin(prune_scores).item()
+                    else:
+                        # Need to prune weights that contribute positively to error
+                        prune_condition = (W_r * E_A > 0) & mask_r.bool()
+                        if prune_condition.any():
+                            wanda_scores = torch.abs(W_r) * torch.norm(activations, dim=0)
+                            prune_scores = mask_r * wanda_scores
+                            prune_scores[~prune_condition] = float('inf')
+                            prune_idx = torch.argmin(prune_scores).item()
+                        else:
+                            # Fallback to standard Wanda
+                            wanda_scores = torch.abs(W_r) * torch.norm(activations, dim=0)
+                            prune_scores = mask_r * wanda_scores
+                            prune_idx = torch.argmin(prune_scores).item()
+                    
+                    # Update mask 
+                    mask_r[grow_idx] = 1
+                    mask_r[prune_idx] = 0
+                    
+                    # Update weights without changing values (just binary mask)
+                    W_sparse_r = W_r * mask_r
+                    
+                    # Update reconstruction error
+                    sparse_out = torch.matmul(activations, W_sparse_r)
+                    new_delta_r = dense_out - sparse_out
+                    
+                    # Check for convergence - if error reduction is small, stop
+                    error_reduction = torch.norm(delta_r) - torch.norm(new_delta_r)
+                    delta_r = new_delta_r
+                    
+                    if error_reduction < error_threshold or torch.norm(new_delta_r) < error_threshold:
+                        break
+                
+                # Apply final mask to this row
+                mask[r] = mask_r
+                W[r] = W_r * mask_r
+                
+                # Print density for this row for tracking
+                density = mask_r.sum().item() / mask_r.numel()
+                print(f"Layer:{name} => Density: {density:.4f}")
+            
+            # Apply final mask to module weights
+            module.weight.data = W
+        
+        # Return weights in the expected format
+        state_dict = sparse_model.state_dict()
+        weights = {}
+        for key, val in state_dict.items():
+            weights[key] = val
+        
+        return weights
+    
     def _quick_eval(self, test_batch):
         """
         Helper method to quickly evaluate model accuracy on a mini-batch.

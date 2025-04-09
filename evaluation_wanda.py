@@ -246,6 +246,8 @@ def evaluation(args, dataset_cfg):
     keep_ratio = args.keep_ratio
     prune_method = args.prune_method
     iterative_steps = args.iterative_steps
+    max_cycles = args.max_cycles
+    error_threshold = args.error_threshold
     calibrate = args.calibrate
     calib_steps = args.calib_steps
     calib_lr = args.calib_lr
@@ -373,6 +375,12 @@ def evaluation(args, dataset_cfg):
                             calib_lr=calib_lr,
                             mini_test_batch=mini_test_batch
                         )
+                    elif prune_method == 'dsnot':
+                        # DSnoT pruning
+                        print(f"Using WANDA+DSnoT pruning with keep_ratio = {keep_ratio}, max_cycles = {max_cycles}")
+                        weights = model.prune_wanda_dsnot(ubatch, keep_ratio=keep_ratio, 
+                                                         max_cycles=max_cycles, 
+                                                         error_threshold=error_threshold)
                     else:
                         raise ValueError(f"Unknown pruning method: {prune_method}")
                 else:
@@ -394,6 +402,12 @@ def evaluation(args, dataset_cfg):
                         
                         weights = model.prune_wanda_iterative(ubatch, final_keep_ratio=keep_ratio, 
                                                               steps=iterative_steps, mini_test_batch=mini_test_batch)
+                    elif prune_method == 'dsnot':
+                        # DSnoT pruning
+                        print(f"Using WANDA+DSnoT pruning with keep_ratio = {keep_ratio}, max_cycles = {max_cycles}")
+                        weights = model.prune_wanda_dsnot(ubatch, keep_ratio=keep_ratio, 
+                                                         max_cycles=max_cycles, 
+                                                         error_threshold=error_threshold)
                     else:
                         raise ValueError(f"Unknown pruning method: {prune_method}")
             
@@ -489,10 +503,14 @@ if __name__ == "__main__":
                       help="Pruning method")
     dset.add_argument("--keep-ratio", type=float, default=0.9,
                       help="Pruning keep ratio")
-    dset.add_argument("--prune-method", type=str, default="wanda", choices=["wanda", "iterative"],
-                      help="Pruning method to use (wanda, iterative)")
+    dset.add_argument("--prune-method", type=str, default="wanda", choices=["wanda", "iterative", "dsnot"],
+                      help="Pruning method to use (wanda, iterative, dsnot)")
     dset.add_argument("--iterative-steps", type=int, default=3,
                       help="Number of steps for iterative pruning")
+    dset.add_argument("--max-cycles", type=int, default=50,
+                      help="Maximum cycles for DSnoT pruning")
+    dset.add_argument("--error-threshold", type=float, default=0.1,
+                      help="Error threshold for DSnoT pruning")
                       
     # Calibration arguments
     calib = parser.add_argument_group('Calibration arguments')
