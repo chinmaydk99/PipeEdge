@@ -17,6 +17,40 @@ from utils.data import ViTFeatureExtractorTransforms
 import model_cfg_dsnot
 from evaluation_tools.evaluation_quant_test import *
 
+# Add the missing function if not available in the imports
+def load_layers_partition(partition, layer_num):
+    """Parse the partition string and return a list of tuples (start_layer, end_layer) for each stage.
+    
+    Args:
+        partition (str): Comma-separated string of partition sizes or 'auto'
+        layer_num (int): Total number of layers in the model
+        
+    Returns:
+        List of tuples (start_layer, end_layer) for each stage
+    """
+    if ',' in partition:
+        partitions = [int(p) for p in partition.split(',')]
+        assert sum(partitions) == layer_num, f"Sum of partitions {sum(partitions)} must equal total layers {layer_num}"
+        
+        stages = []
+        start_layer = 1
+        for p in partitions:
+            end_layer = start_layer + p - 1
+            stages.append((start_layer, end_layer))
+            start_layer = end_layer + 1
+        return stages
+    else:
+        # Assume it's a single number representing equal-sized partitions
+        n_partitions = int(partition)
+        layers_per_partition = layer_num // n_partitions
+        
+        stages = []
+        for i in range(n_partitions):
+            start_layer = i * layers_per_partition + 1
+            end_layer = (i + 1) * layers_per_partition if i < n_partitions - 1 else layer_num
+            stages.append((start_layer, end_layer))
+        return stages
+
 # Keep EnhancedReportAccuracy class, update file naming slightly for clarity
 class EnhancedReportAccuracy():
     def __init__(self, batch_size, output_dir, model_name, partition, quant) -> None:
