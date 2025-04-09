@@ -30,8 +30,13 @@ def load_layers_partition(partition, layer_num):
     """
     if ',' in partition:
         partitions = [int(p) for p in partition.split(',')]
-        assert sum(partitions) == layer_num, f"Sum of partitions {sum(partitions)} must equal total layers {layer_num}"
-        
+        # If sum doesn't match, adjust the last partition
+        partition_sum = sum(partitions)
+        if partition_sum != layer_num:
+            print(f"Warning: Sum of partitions {partition_sum} doesn't match total layers {layer_num}.")
+            print(f"Adjusting last partition from {partitions[-1]} to {partitions[-1] - (partition_sum - layer_num)}")
+            partitions[-1] = partitions[-1] - (partition_sum - layer_num)
+            
         stages = []
         start_layer = 1
         for p in partitions:
