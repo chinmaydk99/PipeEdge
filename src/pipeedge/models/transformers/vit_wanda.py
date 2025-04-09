@@ -633,6 +633,10 @@ class ViTShardForImageClassification(ModuleShard):
                 
                 # Iterative pruning and growing
                 for t in range(max_cycles):
+                    # Print cycle progress periodically
+                    if t == 0 or (t+1) % 10 == 0 or t == max_cycles-1:
+                        print(f"Layer:{name}, Row:{r+1}/{W.size(0)}, Cycle:{t+1}/{max_cycles}, Error:{torch.norm(delta_r):.4f}")
+                    
                     # Calculate statistics needed for growing and pruning decisions
                     # Expected value of activations across batch
                     E_A = torch.mean(activations, dim=0)  # [input_dim]
