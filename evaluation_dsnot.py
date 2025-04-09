@@ -63,7 +63,7 @@ def evaluate_model(model, dataloader, device):
     accuracy = 100.0 * correct / total
     return accuracy
 
-def load_model(model_name, weights_file, device, partition=None):
+def load_model(model_name, weights_file, device, partition=None, prune=False):
     """Load a model with the specified weights."""
     # Get model configuration
     config = model_cfg_dsnot.get_model_config(model_name)
@@ -103,8 +103,8 @@ def load_model(model_name, weights_file, device, partition=None):
             else:
                 raise TypeError(f"Invalid weights_file type: {type(weights_file)}")
             
-            # Instantiate shard
-            shard = model_class(config, shard_config, loaded_weights, prune=True)
+            # Instantiate shard, pass the prune flag
+            shard = model_class(config, shard_config, loaded_weights, prune=prune)
             shard.to(device)
             shard.eval()
             model_shards.append(shard)
@@ -135,8 +135,8 @@ def load_model(model_name, weights_file, device, partition=None):
         else:
              raise TypeError(f"Invalid weights_file type: {type(weights_file)}")
     
-        # Instantiate the model, passing the loaded state_dict mapping or npz filename
-        model = model_class(config, shard_config, loaded_weights, prune=True) 
+        # Instantiate the model, pass the prune flag
+        model = model_class(config, shard_config, loaded_weights, prune=prune) 
         model.to(device)
         model.eval()
         
@@ -229,9 +229,9 @@ def prepare_calibration_batch(val_loader, num_batches=1, device=None):
 
 def run_pruning_comparison(model_name, keep_ratio, dsnot_args, calibration_batch, device):
     """Run and compare WANDA and DSnoT pruning methods."""
-    # Get the original model
+    # Get the original model - Load with prune=False
     original_weights_file = model_cfg_dsnot.get_model_default_weights_file(model_name)
-    original_model = load_model(model_name, original_weights_file, device)
+    original_model = load_model(model_name, original_weights_file, device, prune=False)
     
     # Get model class for pruning - DSnoT
     dsnot_model_class = model_cfg_dsnot.get_model_dict(model_name)['shard_module']
@@ -258,7 +258,7 @@ def run_pruning_comparison(model_name, keep_ratio, dsnot_args, calibration_batch
     del wanda_pruning_instance # Free memory
     torch.cuda.empty_cache() 
     
-    # Create a model instance to load WANDA weights (can use DSnoT class, as loading is compatible)
+    # Create a model instance to load WANDA weights - Load with prune=True
     wanda_pruned_model = dsnot_model_class(config, shard_config, wanda_weights, prune=True) 
     wanda_pruned_model.to(device)
     wanda_pruned_model.eval()
@@ -277,7 +277,7 @@ def run_pruning_comparison(model_name, keep_ratio, dsnot_args, calibration_batch
     del dsnot_pruning_instance # Free memory
     torch.cuda.empty_cache()
     
-    # Create a model instance with DSnoT weights
+    # Create a model instance with DSnoT weights - Load with prune=True
     dsnot_pruned_model = dsnot_model_class(config, shard_config, dsnot_weights, prune=True)
     dsnot_pruned_model.to(device)
     dsnot_pruned_model.eval()
@@ -449,10 +449,10 @@ def main():
         # Partition models if partitioning is specified
         if args.partition:
             print("\n===== Partitioning Models =====")
-            # Load models with partitioning
-            original_model = load_model(args.model, results['original']['weights'], device, args.partition)
-            wanda_model = load_model(args.model, results['wanda']['weights'], device, args.partition)
-            dsnot_model = load_model(args.model, results['dsnot']['weights'], device, args.partition)
+            # Load models with partitioning - pass correct prune flag
+            original_model = load_model(args.model, results['original']['weights'], device, args.partition, prune=False)
+            wanda_model = load_model(args.model, results['wanda']['weights'], device, args.partition, prune=True)
+            dsnot_model = load_model(args.model, results['dsnot']['weights'], device, args.partition, prune=True)
             
             # Evaluate partitioned models
             print("\n===== Evaluating Partitioned Models =====")
@@ -492,15 +492,15 @@ def main():
         dsnot_weights_file = model_cfg_dsnot.get_model_pruned_weights_file(args.model)
         
         if args.partition:
-            # Load models with partitioning
+            # Load models with partitioning - pass correct prune flag
             print(f"Loading original partitioned model from: {original_weights_file}")
-            original_model = load_model(args.model, original_weights_file, device, args.partition)
+            original_model = load_model(args.model, original_weights_file, device, args.partition, prune=False)
             
             print(f"Loading WANDA pruned partitioned model from: {wanda_weights_file}")
-            wanda_model = load_model(args.model, wanda_weights_file, device, args.partition)
+            wanda_model = load_model(args.model, wanda_weights_file, device, args.partition, prune=True)
             
             print(f"Loading DSnoT pruned partitioned model from: {dsnot_weights_file}")
-            dsnot_model = load_model(args.model, dsnot_weights_file, device, args.partition)
+            dsnot_model = load_model(args.model, dsnot_weights_file, device, args.partition, prune=True)
             
             # Evaluate partitioned models
             print("\n===== Evaluating Partitioned Models =====")
@@ -514,15 +514,15 @@ def main():
             print("Evaluating DSnoT pruned partitioned model...")
             dsnot_acc = evaluate_partitioned_model(dsnot_model, val_loader, device, quant_values)
         else:
-            # Load models without partitioning
+            # Load models without partitioning - pass correct prune flag
             print(f"Loading original model from: {original_weights_file}")
-            original_model = load_model(args.model, original_weights_file, device)
+            original_model = load_model(args.model, original_weights_file, device, prune=False)
             
             print(f"Loading WANDA pruned model from: {wanda_weights_file}")
-            wanda_model = load_model(args.model, wanda_weights_file, device)
+            wanda_model = load_model(args.model, wanda_weights_file, device, prune=True)
             
             print(f"Loading DSnoT pruned model from: {dsnot_weights_file}")
-            dsnot_model = load_model(args.model, dsnot_weights_file, device)
+            dsnot_model = load_model(args.model, dsnot_weights_file, device, prune=True)
             
             # Count parameters (only works properly on non-partitioned models)
             original_total, original_nonzero = count_parameters(original_model)
