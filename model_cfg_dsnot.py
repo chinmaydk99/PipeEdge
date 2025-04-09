@@ -33,13 +33,13 @@ _model_cfg_add('google/vit-large-patch16-224', 96, 'ViT-L_16-224.npz',
                vit_dsnot.ViTShardForImageClassification, 'ViT-L_16-224_DSnoT_pruned.npz')
 # Add version with calibration support
 _model_cfg_add('google/vit-large-patch16-224-calib', 96, 'ViT-L_16-224.npz',
-               vit_dsnot.ViTShardForImageClassificationV2, 'ViT-L_16-224_DSnoT_calibrated.npz')
+               vit_dsnot.ViTShardForImageClassification, 'ViT-L_16-224_DSnoT_calibrated.npz')
 # NOTE: This ViT-Huge model doesn't include classification, so the config must be extended
 _model_cfg_add('google/vit-huge-patch14-224-in21k', 128, 'ViT-H_14.npz',
                vit_dsnot.ViTShardForImageClassification, 'ViT-H_14_DSnoT_pruned.npz')
 # Add version with calibration support
 _model_cfg_add('google/vit-huge-patch14-224-in21k-calib', 128, 'ViT-H_14.npz',
-               vit_dsnot.ViTShardForImageClassificationV2, 'ViT-H_14_DSnoT_calibrated.npz')
+               vit_dsnot.ViTShardForImageClassification, 'ViT-H_14_DSnoT_calibrated.npz')
 
 # NOTE: BertModelShard alone doesn't do classification
 _model_cfg_add('bert-base-uncased', 48, 'BERT-B.npz',
