@@ -84,8 +84,11 @@ def load_model(model_name, weights_file, device, partition=None, prune=False):
             shard_config = ModuleShardConfig(layer_start=layer_start, layer_end=layer_end,
                                           is_first=is_first, is_last=is_last)
             
-            # Get the appropriate model class
-            model_class = model_cfg_dsnot.get_model_dict(model_name)['shard_module']
+            # Get the appropriate model class - use WANDA for original weights, DSnoT for pruned weights
+            if prune:
+                model_class = model_cfg_dsnot.get_model_dict(model_name)['shard_module']
+            else:
+                model_class = model_cfg_wanda.get_model_dict(model_name)['shard_module']
             
             # Load weights
             if isinstance(weights_file, str) and os.path.isfile(weights_file):
@@ -116,8 +119,11 @@ def load_model(model_name, weights_file, device, partition=None, prune=False):
         shard_config = ModuleShardConfig(layer_start=1, layer_end=layers, 
                                       is_first=True, is_last=True)
         
-        # Get the appropriate model class
-        model_class = model_cfg_dsnot.get_model_dict(model_name)['shard_module']
+        # Get the appropriate model class - use WANDA for original weights, DSnoT for pruned weights
+        if prune:
+            model_class = model_cfg_dsnot.get_model_dict(model_name)['shard_module']
+        else:
+            model_class = model_cfg_wanda.get_model_dict(model_name)['shard_module']
         
         # Load weights correctly depending on file type
         if isinstance(weights_file, str) and os.path.isfile(weights_file):
@@ -229,20 +235,25 @@ def prepare_calibration_batch(val_loader, num_batches=1, device=None):
 
 def run_pruning_comparison(model_name, keep_ratio, dsnot_args, calibration_batch, device):
     """Run and compare WANDA and DSnoT pruning methods."""
-    # Get the original model - Load with prune=False
+    # Get the original model - Use vit_wanda implementation to load original model
     original_weights_file = model_cfg_dsnot.get_model_default_weights_file(model_name)
-    original_model = load_model(model_name, original_weights_file, device, prune=False)
     
-    # Get model class for pruning - DSnoT
-    dsnot_model_class = model_cfg_dsnot.get_model_dict(model_name)['shard_module']
-    # Get model class for WANDA pruning explicitly
+    # Get model class for WANDA models
     wanda_model_class = model_cfg_wanda.get_model_dict(model_name)['shard_module']
     
-    # Setup configs (same for both)
+    # Create config and get layers
     config = model_cfg_dsnot.get_model_config(model_name)
     layers = model_cfg_dsnot.get_model_layers(model_name)
     shard_config = ModuleShardConfig(layer_start=1, layer_end=layers, 
                                     is_first=True, is_last=True)
+    
+    # Load original model with WANDA implementation that handles transposition correctly
+    original_model = wanda_model_class(config, shard_config, original_weights_file, prune=False)
+    original_model.to(device)
+    original_model.eval()
+    
+    # Get model class for DSnoT
+    dsnot_model_class = model_cfg_dsnot.get_model_dict(model_name)['shard_module']
     
     # Apply WANDA pruning using the WANDA class
     # Instantiate model using WANDA class
@@ -265,7 +276,7 @@ def run_pruning_comparison(model_name, keep_ratio, dsnot_args, calibration_batch
     
     # Apply DSnoT pruning using the DSnoT class
     # Instantiate model using DSnoT class
-    dsnot_pruning_instance = dsnot_model_class(config, shard_config, original_weights_file) 
+    dsnot_pruning_instance = dsnot_model_class(config, shard_config, original_weights_file, prune=False) 
     dsnot_pruning_instance.to(device)
     dsnot_pruning_instance.eval()
     
@@ -494,6 +505,7 @@ def main():
         if args.partition:
             # Load models with partitioning - pass correct prune flag
             print(f"Loading original partitioned model from: {original_weights_file}")
+            # Use WANDA implementation for original model (handles transposition correctly)
             original_model = load_model(args.model, original_weights_file, device, args.partition, prune=False)
             
             print(f"Loading WANDA pruned partitioned model from: {wanda_weights_file}")
@@ -516,6 +528,7 @@ def main():
         else:
             # Load models without partitioning - pass correct prune flag
             print(f"Loading original model from: {original_weights_file}")
+            # Use WANDA implementation for original model (handles transposition correctly)
             original_model = load_model(args.model, original_weights_file, device, prune=False)
             
             print(f"Loading WANDA pruned model from: {wanda_weights_file}")
