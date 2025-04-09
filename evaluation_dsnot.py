@@ -257,7 +257,7 @@ def run_pruning_comparison(model_name, keep_ratio, dsnot_args, calibration_batch
     
     # Apply WANDA pruning using the WANDA class
     # Instantiate model using WANDA class
-    wanda_pruning_instance = wanda_model_class(config, shard_config, original_weights_file) 
+    wanda_pruning_instance = wanda_model_class(config, shard_config, original_weights_file, prune=False) 
     wanda_pruning_instance.to(device)
     wanda_pruning_instance.eval()
     
@@ -274,15 +274,18 @@ def run_pruning_comparison(model_name, keep_ratio, dsnot_args, calibration_batch
     wanda_pruned_model.to(device)
     wanda_pruned_model.eval()
     
-    # Apply DSnoT pruning using the DSnoT class
-    # Instantiate model using DSnoT class
-    dsnot_pruning_instance = dsnot_model_class(config, shard_config, original_weights_file, prune=False) 
+    # Apply DSnoT pruning - BUT use the WANDA pruned weights as starting point!
+    print("--- Applying DSnoT Refinement to WANDA Weights ---")
+    start_time = time.time()
+    
+    # Instantiate DSnoT with WANDA pruned weights
+    dsnot_pruning_instance = dsnot_model_class(config, shard_config, wanda_weights, prune=True)
     dsnot_pruning_instance.to(device)
     dsnot_pruning_instance.eval()
     
-    print("--- Applying WANDA + DSnoT Pruning ---")
-    start_time = time.time()
     # Call prune_wanda_dsnot from the DSnoT instance
+    print("Starting DSnoT refinement using provided hyperparameters...")
+    # Directly use the ubatch that was passed to WANDA pruning
     dsnot_weights = dsnot_pruning_instance.prune_wanda_dsnot(calibration_batch, dsnot_args, keep_ratio=keep_ratio) 
     dsnot_time = time.time() - start_time
     del dsnot_pruning_instance # Free memory
@@ -359,8 +362,8 @@ def main():
                       help='Evaluation batch size (default: 64)')
     parser.add_argument('-tb', '--train-batch-size', type=int, default=64,
                       help='Training batch size for pruning (default: 64)')
-    parser.add_argument('--calib-batches', type=int, default=10,
-                      help='Number of batches to use for calibration (default: 10)')
+    parser.add_argument('--calib-batches', type=int, default=1,
+                      help='Number of batches to use for calibration (default: 1)')
     
     # Pruning options
     parser.add_argument('--prune', type=bool, nargs='?', const=True, default=False,
