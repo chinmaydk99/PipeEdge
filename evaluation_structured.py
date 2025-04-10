@@ -511,6 +511,10 @@ if __name__ == "__main__":
                       help="Pruning method to use (structured, structured_only)")
     dset.add_argument("--iterative-steps", type=int, default=3,
                       help="Number of steps for iterative pruning")
+    dset.add_argument("--max-cycles", type=int, default=1,
+                      help="Maximum number of cycles for iterative methods")
+    dset.add_argument("--error-threshold", type=float, default=0.01,
+                      help="Error threshold for early stopping in iterative methods")
 
                       
     # Calibration arguments
