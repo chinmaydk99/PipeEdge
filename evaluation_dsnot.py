@@ -213,7 +213,9 @@ def _make_shard(model_name, model_file, stage_layers, stage, q_bits, prune):
                                             stage_layers[stage][1], stage, prune)
     shard.register_buffer('quant_bits', q_bits)
     # Also register quant_bit (singular) for compatibility with runtime.py
-    shard.register_buffer('quant_bit', torch.tensor(q_bits[1]), persistent=False)
+    # Ensure q_bits[1] is a scalar regardless of input shape
+    bit_value = q_bits[1].item() if isinstance(q_bits[1], torch.Tensor) else q_bits[1]
+    shard.register_buffer('quant_bit', torch.tensor(bit_value, dtype=torch.float), persistent=False)
     shard.eval()
     return shard
 

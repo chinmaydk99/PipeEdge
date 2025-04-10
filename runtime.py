@@ -96,10 +96,19 @@ def forward_hook_quant_encode(module, _input_arg, output: Union[torch.Tensor, Tu
     
     # First try quant_bit attribute (most common case)
     if hasattr(module, 'quant_bit'):
-        if isinstance(module.quant_bit, torch.Tensor):
-            quant_bit = module.quant_bit.item()
-        else:
-            quant_bit = module.quant_bit
+        try:
+            if isinstance(module.quant_bit, torch.Tensor):
+                if module.quant_bit.numel() > 1:
+                    # If multi-element tensor, use first element and warn
+                    print(f"Warning: Expected scalar tensor for quant_bit, got tensor with {module.quant_bit.numel()} elements")
+                    quant_bit = module.quant_bit.flatten()[0].item()
+                else:
+                    quant_bit = module.quant_bit.item()
+            else:
+                quant_bit = module.quant_bit
+        except (IndexError, AttributeError, RuntimeError) as e:
+            print(f"Warning: Error accessing quant_bit: {e}. Defaulting to 0")
+            quant_bit = 0
     # Then try quant_bits attribute (fallback case)
     elif hasattr(module, 'quant_bits'):
         try:
