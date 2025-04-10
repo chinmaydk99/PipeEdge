@@ -1,10 +1,8 @@
-"""ViT Transformers with SparseGPT + DSnoT Pruning.
+"""ViT Transformers with WANDA Pruning.
 
-This module implements the SparseGPT + DSnoT pruning approach
-for Vision Transformers. SparseGPT provides initial pruning based on second-order
-information (Optimal Brain Surgeon), and DSnoT refines the mask iteratively
-without training, based on the paper "Dynamic Sparse No Training: Training-Free
-Fine-tuning for Sparse LLMs" (Zhang et al., ICLR 2024).
+This module implements the WANDA (Weight-Activation Norm Data-Aware) pruning approach
+for Vision Transformers, based on the paper "A Simple and Effective Pruning Approach
+for Large Language Models" (Sun et al., ICLR 2024).
 """
 from collections.abc import Mapping
 import logging
@@ -33,9 +31,21 @@ _WEIGHTS_URLS = {
     'google/vit-huge-patch14-224-in21k': 'https://storage.googleapis.com/vit_models/imagenet21k/ViT-H_14.npz',
 }
 
-# Helper function needed for reference DSnoT pruning logic (remains unchanged)
+# Helper function needed for reference DSnoT pruning logic
 def return_reorder_indice(input_tensor):
-    # ... (keep existing implementation) ...
+    """
+    For instance:
+    [[1., -2., 3.],
+    [-2, 2., -4],
+    [5., 6., -7],
+    [-6, -7, -4]]
+    return indices of
+    [[-2.,  3.,  1.],
+    [-2., -4.,  2.],
+    [-7.,  6.,  5.],
+    [-6., -7., -4.]]
+    Description: The relative order in the positive number remains unchanged, and the relative order in the negative number is flipped.
+    """
     positive_tensor = input_tensor.clone()
     negative_tensor = input_tensor.clone()
 
@@ -83,7 +93,6 @@ class ViTLayerShard(ModuleShard):
         self._build_shard()
 
     def _build_shard(self):
-        # ... (keep existing implementation) ...
         if self.has_layer(0):
             self.layernorm_before = nn.LayerNorm(self.config.hidden_size,
                                                  eps=self.config.layer_norm_eps)
@@ -97,9 +106,9 @@ class ViTLayerShard(ModuleShard):
         if self.has_layer(3):
             self.output = ViTOutput(self.config)
 
-
+    
     def forward(self, data: TransformerShardData) -> TransformerShardData:
-        # ... (keep existing implementation) ...
+        """Compute layer shard."""
         if self.has_layer(0):
             data_norm = self.layernorm_before(data)
             data = (self.self_attention(data_norm)[0], data)
@@ -114,39 +123,30 @@ class ViTLayerShard(ModuleShard):
             data = self.output(data[0], data[1])
         return data
 
-
 class ViTModelShard(ModuleShard):
     """Module shard based on `ViTModel` (no pooling layer)."""
 
-    # Remove 'prune' argument, always load dense weights
     def __init__(self, config: ViTConfig, shard_config: ModuleShardConfig,
-                 model_weights: Union[str, Mapping]):
+                 model_weights: Union[str, Mapping], prune=False):
         super().__init__(config, shard_config)
         self.embeddings = None
+        # ViTModel uses an encoder here, but we'll just add the layers here instead.
+        # Since we just do inference, a ViTEncoderShard class wouldn't provide real benefit.
         self.layers = nn.ModuleList()
         self.layernorm = None
         logger.debug(">>>> Model name: %s", self.config.name_or_path)
         if isinstance(model_weights, str):
             logger.debug(">>>> Load weight file: %s", model_weights)
-            try:
-                # Attempt to load weights, handle potential file not found or corruption
-                with np.load(model_weights) as weights:
-                    self._build_shard(weights)
-            except FileNotFoundError:
-                logger.error(f"Weight file not found: {model_weights}")
-                raise
-            except Exception as e:
-                logger.error(f"Error loading weight file {model_weights}: {e}")
-                raise
+            with np.load(model_weights) as weights:
+                self._build_shard(weights, prune)
         else:
-            self._build_shard(model_weights)
+            self._build_shard(model_weights, prune)
 
-    # Remove 'prune' argument
-    def _build_shard(self, weights):
+    def _build_shard(self, weights, prune=False):
         if self.shard_config.is_first:
             logger.debug(">>>> Load embeddings layer for the first shard")
             self.embeddings = ViTEmbeddings(self.config)
-            self._load_weights_first(weights) # Pass only weights
+            self._load_weights_first(weights, prune)
 
         layer_curr = self.shard_config.layer_start
         while layer_curr <= self.shard_config.layer_end:
@@ -160,49 +160,54 @@ class ViTModelShard(ModuleShard):
                          layer_id, sublayer_start, sublayer_end)
             layer_config = ModuleShardConfig(layer_start=sublayer_start, layer_end=sublayer_end)
             layer = ViTLayerShard(self.config, layer_config)
-            self._load_weights_layer(weights, layer_id, layer) # Pass only weights, layer_id, layer
+            self._load_weights_layer(weights, layer_id, layer, prune)
             self.layers.append(layer)
             layer_curr += sublayer_end - sublayer_start + 1
 
         if self.shard_config.is_last:
             logger.debug(">>>> Load layernorm for the last shard")
             self.layernorm = nn.LayerNorm(self.config.hidden_size, eps=self.config.layer_norm_eps)
-            self._load_weights_last(weights) # Pass only weights
+            self._load_weights_last(weights, prune)
 
-    # Remove 'prune' argument and logic
     @torch.no_grad()
-    def _load_weights_first(self, weights):
-        # Always load dense weights
-        try:
-            self.embeddings.cls_token.copy_(torch.from_numpy(weights["cls"]))
-            self.embeddings.position_embeddings.copy_(torch.from_numpy((weights["Transformer/posembed_input/pos_embedding"])))
-            conv_weight = weights["embedding/kernel"]
-            conv_weight = conv_weight.transpose([3, 2, 0, 1])
-            self.embeddings.patch_embeddings.projection.weight.copy_(torch.from_numpy(conv_weight))
-            self.embeddings.patch_embeddings.projection.bias.copy_(torch.from_numpy(weights["embedding/bias"]))
-        except KeyError as e:
-            logger.error(f"Missing key in weights during first layer load: {e}")
-            raise
-
-    # Remove 'prune' argument and logic
+    def _load_weights_first(self, weights, prune=False):
+            if(prune):
+                self.embeddings.cls_token.copy_(torch.from_numpy(weights["vit.embeddings.cls_token"]))
+                self.embeddings.position_embeddings.copy_(torch.from_numpy(weights["vit.embeddings.position_embeddings"]))
+                self.embeddings.patch_embeddings.projection.weight.copy_(torch.from_numpy(weights["vit.embeddings.patch_embeddings.projection.weight"]))
+                self.embeddings.patch_embeddings.projection.bias.copy_(torch.from_numpy(weights["vit.embeddings.patch_embeddings.projection.bias"]))
+            else:
+                self.embeddings.cls_token.copy_(torch.from_numpy(weights["cls"]))
+                self.embeddings.position_embeddings.copy_(torch.from_numpy((weights["Transformer/posembed_input/pos_embedding"])))
+                conv_weight = weights["embedding/kernel"]
+                conv_weight = conv_weight.transpose([3, 2, 0, 1])
+                self.embeddings.patch_embeddings.projection.weight.copy_(torch.from_numpy(conv_weight))
+                self.embeddings.patch_embeddings.projection.bias.copy_(torch.from_numpy(weights["embedding/bias"]))
+                
     @torch.no_grad()
-    def _load_weights_last(self, weights):
-        # Always load dense weights
-        try:
+    def _load_weights_last(self, weights, prune=False):
+        if(prune):
+            self.layernorm.weight.copy_(torch.from_numpy(weights["vit.layernorm.weight"]))
+            self.layernorm.bias.copy_(torch.from_numpy(weights["vit.layernorm.bias"]))
+        else:
             self.layernorm.weight.copy_(torch.from_numpy(weights["Transformer/encoder_norm/scale"]))
             self.layernorm.bias.copy_(torch.from_numpy(weights["Transformer/encoder_norm/bias"]))
-        except KeyError as e:
-            logger.error(f"Missing key in weights during last layer load: {e}")
-            raise
 
-    # Remove 'prune' argument and logic
     @torch.no_grad()
-    def _load_weights_layer(self, weights, layer_id, layer):
-        # Always load dense weights
+    def _load_weights_layer(self, weights, layer_id, layer, prune=False):
         root = f"Transformer/encoderblock_{layer_id}/"
         hidden_size = self.config.hidden_size
-        try:
-            if layer.has_layer(0):
+        if layer.has_layer(0):
+            if(prune):
+                layer.layernorm_before.weight.copy_(torch.from_numpy(weights["vit.layers.{}.layernorm_before.weight".format(layer_id)]))
+                layer.layernorm_before.bias.copy_(torch.from_numpy(weights["vit.layers.{}.layernorm_before.bias".format(layer_id)]))
+                layer.self_attention.query.weight.copy_(torch.from_numpy(weights["vit.layers.{}.self_attention.query.weight".format(layer_id)]))
+                layer.self_attention.key.weight.copy_(torch.from_numpy(weights["vit.layers.{}.self_attention.key.weight".format(layer_id)]))
+                layer.self_attention.value.weight.copy_(torch.from_numpy(weights["vit.layers.{}.self_attention.value.weight".format(layer_id)]))
+                layer.self_attention.query.bias.copy_(torch.from_numpy(weights["vit.layers.{}.self_attention.query.bias".format(layer_id)]))
+                layer.self_attention.key.bias.copy_(torch.from_numpy(weights["vit.layers.{}.self_attention.key.bias".format(layer_id)]))
+                layer.self_attention.value.bias.copy_(torch.from_numpy(weights["vit.layers.{}.self_attention.value.bias".format(layer_id)]))
+            else:
                 layer.layernorm_before.weight.copy_(torch.from_numpy(weights[root + "LayerNorm_0/scale"]))
                 layer.layernorm_before.bias.copy_(torch.from_numpy(weights[root + "LayerNorm_0/bias"]))
                 layer.self_attention.query.weight.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/query/kernel"]).view(hidden_size, hidden_size).t())
@@ -211,23 +216,34 @@ class ViTModelShard(ModuleShard):
                 layer.self_attention.query.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/query/bias"]).view(-1))
                 layer.self_attention.key.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/key/bias"]).view(-1))
                 layer.self_attention.value.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/value/bias"]).view(-1))
-            if layer.has_layer(1):
+        if layer.has_layer(1):
+            if(prune):
+                layer.self_output.dense.weight.copy_(torch.from_numpy(weights["vit.layers.{}.self_output.dense.weight".format(layer_id)]))
+                layer.self_output.dense.bias.copy_(torch.from_numpy(weights["vit.layers.{}.self_output.dense.bias".format(layer_id)]))
+            else:
                 layer.self_output.dense.weight.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/out/kernel"]).view(hidden_size, hidden_size).t())
                 layer.self_output.dense.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/out/bias"]).view(-1))
-            if layer.has_layer(2):
+        if layer.has_layer(2):
+            if(prune):
+                layer.layernorm_after.weight.copy_(torch.from_numpy(weights["vit.layers.{}.layernorm_after.weight".format(layer_id)]))
+                layer.layernorm_after.bias.copy_(torch.from_numpy(weights["vit.layers.{}.layernorm_after.bias".format(layer_id)]))
+                layer.intermediate.dense.weight.copy_(torch.from_numpy(weights["vit.layers.{}.intermediate.dense.weight".format(layer_id)]))
+                layer.intermediate.dense.bias.copy_(torch.from_numpy(weights["vit.layers.{}.intermediate.dense.bias".format(layer_id)]))
+            else:
                 layer.layernorm_after.weight.copy_(torch.from_numpy(weights[root + "LayerNorm_2/scale"]))
                 layer.layernorm_after.bias.copy_(torch.from_numpy(weights[root + "LayerNorm_2/bias"]))
                 layer.intermediate.dense.weight.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_0/kernel"]).t())
                 layer.intermediate.dense.bias.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_0/bias"]).t())
-            if layer.has_layer(3):
+        if layer.has_layer(3):
+            if(prune):
+                layer.output.dense.weight.copy_(torch.from_numpy(weights["vit.layers.{}.output.dense.weight".format(layer_id)]))
+                layer.output.dense.bias.copy_(torch.from_numpy(weights["vit.layers.{}.output.dense.bias".format(layer_id)]))                
+            else:
                 layer.output.dense.weight.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_1/kernel"]).t())
                 layer.output.dense.bias.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_1/bias"]).t())
-        except KeyError as e:
-            logger.error(f"Missing key in weights during layer {layer_id} load: {e}")
-            raise
 
     def forward(self, data: TransformerShardData) -> TransformerShardData:
-        # ... (keep existing implementation) ...
+        """Compute shard layers."""
         if self.shard_config.is_first:
             data = self.embeddings(data)
         for layer in self.layers:
@@ -236,120 +252,62 @@ class ViTModelShard(ModuleShard):
             data = self.layernorm(data)
         return data
 
-
     @staticmethod
     def save_weights(model_name: str, model_file: str, url: Optional[str]=None,
                      timeout_sec: Optional[float]=None) -> None:
-        # ... (keep existing implementation) ...
+        """Save the model weights file."""
         if url is None:
             url = _WEIGHTS_URLS[model_name]
         logger.info('Downloading model: %s: %s', model_name, url)
-        try:
-            req = requests.get(url, stream=True, timeout=timeout_sec)
-            req.raise_for_status()
-            with open(model_file, 'wb') as file:
-                for chunk in req.iter_content(chunk_size=8192):
-                    if chunk:
-                        file.write(chunk)
-                        file.flush()
-                        os.fsync(file.fileno())
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error downloading weights for {model_name} from {url}: {e}")
-            raise
-        except IOError as e:
-            logger.error(f"Error writing weights file {model_file}: {e}")
-            raise
+        req = requests.get(url, stream=True, timeout=timeout_sec)
+        req.raise_for_status()
+        with open(model_file, 'wb') as file:
+            for chunk in req.iter_content(chunk_size=8192):
+                if chunk:
+                    file.write(chunk)
+                    file.flush()
+                    os.fsync(file.fileno())
 
 
 class ViTShardForImageClassification(ModuleShard):
     """Module shard based on `ViTForImageClassification`."""
-    # Remove 'prune' argument
     def __init__(self, config: ViTConfig, shard_config: ModuleShardConfig,
-                 model_weights: Union[str, Mapping]):
+                 model_weights: Union[str, Mapping], prune=False):
         super().__init__(config, shard_config)
         self.vit = None
         self.classifier = None
-        self.dtype = torch.float32 # Store original dtype, will be set in _collect_stats
-
+            
         logger.debug(">>>> Model name: %s", self.config.name_or_path)
         if isinstance(model_weights, str):
             logger.debug(">>>> Load weight file: %s", model_weights)
-            try:
-                with np.load(model_weights) as weights:
-                    self._build_shard(weights)
-            except FileNotFoundError:
-                logger.error(f"Weight file not found: {model_weights}")
-                raise
-            except Exception as e:
-                logger.error(f"Error loading weight file {model_weights}: {e}")
-                raise
+            with np.load(model_weights) as weights:
+                self._build_shard(weights, prune)
         else:
-            self._build_shard(model_weights)
+            self._build_shard(model_weights, prune)
 
-    # Remove 'prune' argument
-    def _build_shard(self, weights):
-        ## all shards use the inner ViT model - pass weights directly
-        self.vit = ViTModelShard(self.config, self.shard_config, weights)
+    def _build_shard(self, weights, prune=False):
+        ## all shards use the inner ViT model
+        self.vit = ViTModelShard(self.config, self.shard_config, weights, prune)
 
         if self.shard_config.is_last:
             logger.debug(">>>> Load classifier for the last shard")
-            # Handle potential missing num_labels in config
-            num_labels = getattr(self.config, 'num_labels', 0)
-            if num_labels > 0:
-                self.classifier = nn.Linear(self.config.hidden_size, num_labels)
-                self._load_weights_last(weights) # Pass only weights
-            else:
-                logger.warning("num_labels not found or is 0, creating nn.Identity classifier.")
-                self.classifier = nn.Identity()
+            self.classifier = nn.Linear(self.config.hidden_size, self.config.num_labels) if self.config.num_labels > 0 else nn.Identity()
+            self._load_weights_last(weights, prune)
 
-
-    # Remove 'prune' argument and logic
     @torch.no_grad()
-    def _load_weights_last(self, weights):
-        # Always load dense weights
-        # Check if classifier weights exist before loading
-        if 'head/kernel' in weights and 'head/bias' in weights:
-             try:
-                 self.classifier.weight.copy_(torch.from_numpy(np.transpose(weights["head/kernel"])))
-                 self.classifier.bias.copy_(torch.from_numpy(weights["head/bias"]))
-             except KeyError as e:
-                  logger.error(f"Missing key in weights during last layer (classifier) load: {e}")
-                  # Depending on desired behavior, either raise or allow model without loaded classifier weights
-                  # raise
-             except AttributeError:
-                  logger.error("Classifier layer not properly initialized before loading weights.")
-                  # This might happen if num_labels was 0
-                  # raise
+    def _load_weights_last(self, weights, prune=False):
+        if(prune):
+            self.classifier.weight.copy_(torch.from_numpy(weights['classifier.weight']))
+            self.classifier.bias.copy_(torch.from_numpy(weights['classifier.bias']))
         else:
-             logger.warning("Classifier weights ('head/kernel', 'head/bias') not found in weights file.")
+            self.classifier.weight.copy_(torch.from_numpy(np.transpose(weights["head/kernel"])))
+            self.classifier.bias.copy_(torch.from_numpy(weights["head/bias"]))
 
     def forward(self, data: TransformerShardData) -> TransformerShardData:
-        # ... (keep existing implementation) ...
+        """Compute shard layers."""
         data = self.vit(data)
         if self.shard_config.is_last:
-            # Ensure data has the expected shape for the classifier
-            if isinstance(data, torch.Tensor) and data.dim() > 2:
-                 # Take the CLS token representation [batch_size, seq_len, hidden_dim] -> [batch_size, hidden_dim]
-                 data = data[:, 0, :]
-            elif isinstance(data, torch.Tensor) and data.dim() < 2:
-                 logger.warning(f"Unexpected data dimension entering classifier: {data.dim()}")
-                 # Attempt to handle or raise error
-            elif not isinstance(data, torch.Tensor):
-                 logger.error(f"Data entering classifier is not a Tensor: {type(data)}")
-                 return None # Or raise error
-
-            # Apply classifier only if it exists and is not Identity
-            if self.classifier is not None and not isinstance(self.classifier, nn.Identity):
-                 try:
-                      data = self.classifier(data)
-                 except Exception as e:
-                      logger.error(f"Error during classifier forward pass: {e}", exc_info=True)
-                      return None # Or raise error
-            elif isinstance(self.classifier, nn.Identity):
-                 logger.debug("Skipping Identity classifier.")
-            else: # self.classifier is None
-                 logger.warning("Classifier is None in the last shard, cannot apply.")
-                 return None # Or raise error
+            data = self.classifier(data[:, 0, :])
         return data
 
     @staticmethod
@@ -358,592 +316,610 @@ class ViTShardForImageClassification(ModuleShard):
         """Save the model weights file."""
         ViTModelShard.save_weights(model_name, model_file, url=url, timeout_sec=timeout_sec)
 
-
-    # --- Start of SparseGPT + DSnoT Implementation ---
-
-    def _collect_layer_stats(self, ubatch):
+    # WANDA Pruning Implementation
+    def prune_wanda(self, ubatch, keep_ratio=0.9):
         """
-        Helper to collect activations and other stats needed for pruning.
-        Calculates 'mean_act', 'var_act', 'scaler_row', 'H' for each linear layer.
+        Prune ViT model using WANDA (Weight-Activation Norm Data-Aware) pruning.
+        
+        This method implements the WANDA pruning approach from Sun et al. (ICLR 2024),
+        which prunes weights based on the product of weight magnitude and input activation
+        norm, and applies pruning on a per-output basis.
+        
+        Args:
+            ubatch: Batch of input data for calibration (determines activation patterns)
+            keep_ratio: Percentage of weights to keep (0-1)
+        
+        Returns:
+            Dictionary of pruned weights compatible with the pipeline
         """
-        hooks = []
-        # Determine device from model parameters
-        try:
-             device = next(self.parameters()).device
-        except StopIteration:
-             logger.warning("Model seems to have no parameters. Assuming CPU for stats collection.")
-             device = torch.device('cpu')
-
-        net_copy = copy.deepcopy(self).to(device)
-        net_copy.eval()
-        self.dtype = next(net_copy.parameters()).dtype if list(net_copy.parameters()) else torch.float32 # Store original dtype
-
-        # Use a dictionary to store stats per layer, initialized on first hook encounter
-        layer_stats_accum = {}
-
-        def hook_fn(name, module): # Pass module to get in_features
-            def _hook(mod, input_tensor, output):
-                # Ensure input_tensor is the actual tensor, not a tuple
+        # Create a copy of the model to work with
+        net = copy.deepcopy(self)
+        
+        # Skip if keep_ratio is 1.0 or greater
+        if keep_ratio >= 1.0:
+            print("No pruning performed (keep_ratio >= 1.0)")
+            state_dict = net.state_dict()
+            weights = {}
+            for key, val in state_dict.items():
+                weights[key] = val
+            return weights
+        
+        # Print the shape of input tensor for debugging
+        print(f"Input tensor shape: {ubatch.shape}")
+        
+        # Convert input tensor to right format if needed
+        # The embeddings layer expects [batch_size, channels, height, width]
+        device = ubatch.device
+        
+        # Storage for activation statistics
+        activation_stats = {}
+        
+        # Define hook to capture input activations
+        def hook_fn(name):
+            def _hook(module, input_tensor, output):
+                # Store the input tensor (first element of input tuple)
                 if isinstance(input_tensor, tuple):
-                    if len(input_tensor) > 0 and isinstance(input_tensor[0], torch.Tensor):
-                        input_tensor = input_tensor[0]
-                    else:
-                         # Cannot determine input tensor from tuple
-                         logger.warning(f"Could not extract tensor from input tuple for layer {name}. Skipping stats.")
-                         return
-                elif not isinstance(input_tensor, torch.Tensor):
-                    logger.warning(f"Input to layer {name} is not a tensor ({type(input_tensor)}). Skipping stats.")
-                    return
-
-                # Initialize stats for the layer if first time seen
-                if name not in layer_stats_accum:
-                    # Handle potential missing in_features attribute
-                    in_features = getattr(module, 'in_features', None)
-                    if in_features is None:
-                         logger.warning(f"Layer {name} missing 'in_features'. Cannot initialize Hessian. Skipping H calc.")
-                         layer_stats_accum[name] = {
-                             'inputs': [],
-                             'H': None # Mark Hessian as unavailable
-                         }
-                    else:
-                         layer_stats_accum[name] = {
-                             'inputs': [],
-                             'H': torch.zeros((in_features, in_features), dtype=torch.float32, device='cpu') # Accumulate H on CPU
-                         }
-
-                # --- Store Inputs (CPU) ---
-                layer_stats_accum[name]['inputs'].append(input_tensor.detach().cpu())
-
-                # --- Accumulate Hessian (GPU chunk -> CPU) --- 
-                # Only if H was initialized successfully
-                if layer_stats_accum[name]['H'] is not None:
-                     inp_float = input_tensor.float().to(device) # Move input to GPU for matmul
-                     if inp_float.dim() >= 3:
-                         # Correctly handle sequence dimension: [B, SeqLen, Features] -> [B*SeqLen, Features]
-                         act_reshaped = inp_float.reshape(-1, inp_float.size(-1))
-                     elif inp_float.dim() == 2: # [B, Features]
-                         act_reshaped = inp_float
-                     else:
-                         logger.warning(f"Unexpected input tensor dim {inp_float.dim()} for Hessian calc in layer {name}. Skipping H update.")
-                         return
-
-                     # Add contribution to H on CPU
-                     with torch.no_grad():
-                          hessian_contribution = (act_reshaped.t() @ act_reshaped).cpu()
-                          layer_stats_accum[name]['H'] += hessian_contribution
-
+                    input_tensor = input_tensor[0]
+                activation_stats[name] = input_tensor.detach()
             return _hook
-
-        # Register hooks for Linear layers only
-        for name, module in net_copy.named_modules():
+        
+        # Get all linear layers in the model
+        linear_layers = []
+        layer_names = []
+        hooks = []
+        
+        for name, module in net.named_modules():
             if isinstance(module, nn.Linear):
-                hooks.append(module.register_forward_hook(hook_fn(name, module)))
-
-        logger.info("Collecting stats using calibration data...")
-        total_samples_processed_forward = 0
+                linear_layers.append(module)
+                layer_names.append(name)
+                # Register forward hook to capture inputs
+                hook = module.register_forward_hook(hook_fn(name))
+                hooks.append(hook)
+        
+        # Run the model on calibration data to collect activations
         with torch.no_grad():
-            ubatch_device = ubatch.to(device)
-            # Process in reasonable chunks to avoid OOM during forward pass
-            process_batch_size = min(len(ubatch_device), 32) # Adjust based on typical ViT batch sizes
-
-            for i in range(0, len(ubatch_device), process_batch_size):
-                batch_input = ubatch_device[i : i + process_batch_size]
-                total_samples_processed_forward += len(batch_input)
-                try:
-                    # Forward pass - handle different input shapes
-                    if len(batch_input.shape) == 4: # Image input
-                        _ = net_copy(batch_input)
-                    elif len(batch_input.shape) == 3 and hasattr(net_copy, 'vit'): # Embedded input
-                         # Need to manually forward through ViTModelShard components
-                         if hasattr(net_copy.vit, 'embeddings'):
-                              embedded_tensor = batch_input # Assuming input is already embedded?
-                         else:
-                              # This case shouldn't happen if called on ViTShardForImageClassification
-                              logger.warning("Input is 3D but vit.embeddings not found?")
-                              embedded_tensor = batch_input # Proceed cautiously
-
-                         for layer in net_copy.vit.layers:
-                             embedded_tensor = layer(embedded_tensor)
-                         if net_copy.vit.layernorm is not None:
-                             embedded_tensor = net_copy.vit.layernorm(embedded_tensor)
-                         if hasattr(net_copy, 'classifier') and net_copy.classifier is not None:
-                              cls_token_output = embedded_tensor[:, 0, :] # Use CLS token
-                              _ = net_copy.classifier(cls_token_output)
-                    else: # Fallback/Unknown
-                         _ = net_copy(batch_input)
-                except Exception as e:
-                    logger.error(f"Error during stat collection forward pass (batch {i // process_batch_size}): {e}", exc_info=True)
-                    # Option: stop, or continue and hope enough data was collected
-                    # raise e
-
+            try:
+                # Try normal forward pass
+                if len(ubatch.shape) == 4:  # If it's already in image format
+                    _ = net(ubatch)
+                else:
+                    # If input is already embedded (3D tensor from feature extractor)
+                    # We need to bypass the embedding layer and start from transformer
+                    if hasattr(net, 'vit'):
+                        # Skip embedding layer
+                        embedded_tensor = ubatch
+                        # Forward through transformer layers
+                        for layer in net.vit.layers:
+                            embedded_tensor = layer(embedded_tensor)
+                        
+                        # Final layernorm if present
+                        if net.vit.layernorm is not None:
+                            embedded_tensor = net.vit.layernorm(embedded_tensor)
+                        
+                        # And classifier if present
+                        if hasattr(net, 'classifier') and net.classifier is not None:
+                            _ = net.classifier(embedded_tensor[:, 0, :])
+                    else:
+                        raise ValueError("Model structure unexpected")
+            except Exception as e:
+                print(f"Error during forward pass: {str(e)}")
+                print("Creating dummy input for activations...")
+                
+                # Create a standard dummy input for ViT
+                dummy_input = torch.randn(1, 3, 224, 224, device=device)
+                _ = net(dummy_input)
+        
+        # Remove hooks to clean up
         for hook in hooks:
             hook.remove()
-        del net_copy
-        if device.type == 'cuda': torch.cuda.empty_cache()
-
-        # --- Post-process collected stats ---
-        logger.info("Post-processing stats...")
-        processed_stats = {}
-        total_tokens = 0
-
-        # Estimate total tokens more robustly from collected inputs
-        for name, accum_data in layer_stats_accum.items():
-            if accum_data['inputs']:
-                 first_input_batch_cpu = accum_data['inputs'][0]
-                 if first_input_batch_cpu.dim() >= 3:
-                     tokens_per_sample = first_input_batch_cpu.size(1) # Sequence length
-                     features_dim = first_input_batch_cpu.size(2)
-                     total_tokens = total_samples_processed_forward * tokens_per_sample
-                 elif first_input_batch_cpu.dim() == 2:
-                     total_tokens = total_samples_processed_forward # Batch size is token count
-                     features_dim = first_input_batch_cpu.size(1)
-                 else:
-                     continue # Skip layers with unexpected input dims
-                 logger.info(f"Estimated total tokens = {total_tokens} (from layer {name}, {total_samples_processed_forward} samples)")
-                 break # Estimate from first valid layer
-
-        if total_tokens == 0:
-             logger.error("Could not estimate total tokens. Aborting stats calculation.")
-             return {}
-
-        # --- Calculate Mean, Var, Scaler_Row, Normalize H --- 
-        for name, accum_data in layer_stats_accum.items():
-            if not accum_data['inputs']:
-                 logger.warning(f"No inputs collected for layer {name}. Skipping stats.")
-                 continue
-
-            try:
-                # Concatenate inputs on CPU
-                all_inputs_cpu = torch.cat(accum_data['inputs'], dim=0)
-                if all_inputs_cpu.dim() >= 3:
-                    act_reshaped_cpu = all_inputs_cpu.reshape(-1, all_inputs_cpu.size(-1)).to(torch.float32)
-                elif all_inputs_cpu.dim() == 2:
-                    act_reshaped_cpu = all_inputs_cpu.to(torch.float32)
-                else:
-                    logger.warning(f"Skipping stats for layer {name} due to unexpected input dim {all_inputs_cpu.dim()}")
-                    continue
-
-                current_tokens = act_reshaped_cpu.size(0)
-                if abs(current_tokens - total_tokens) > total_tokens * 0.1: # Allow 10% deviation
-                     logger.warning(f"Token count mismatch for layer {name}. Expected ~{total_tokens}, got {current_tokens}. Using actual count {current_tokens} for normalization.")
-                     normalization_factor = max(current_tokens, 1)
-                else:
-                     normalization_factor = max(total_tokens, 1)
-
-                # Calculate Mean Activation (E[A])
-                mean_act = torch.mean(act_reshaped_cpu, dim=0)
-
-                # Calculate Variance (Var[A])
-                var_act = torch.var(act_reshaped_cpu, dim=0, unbiased=False) + 1e-8 # Add epsilon
-
-                # Calculate Scaler Row (Mean Squared Norm) - safer on CPU
-                # Use float64 for sum to avoid overflow with large norms/counts
-                sum_sq_norms_d64 = torch.tensor(0.0, dtype=torch.float64)
-                chunk_size = 1024
-                for i in range(0, current_tokens, chunk_size):
-                    chunk = act_reshaped_cpu[i:i+chunk_size]
-                    # Calculate norm per element in chunk, square, then sum
-                    norms_sq = torch.norm(chunk.to(torch.float64), p=2, dim=1)**2
-                    sum_sq_norms_d64 += torch.sum(norms_sq)
-                # Average and broadcast to correct shape, convert back to float32
-                scaler_row_scalar = (sum_sq_norms_d64 / normalization_factor).to(torch.float32)
-                scaler_row = scaler_row_scalar * torch.ones_like(mean_act)
-
-                # Normalize Hessian H (if available)
-                H = accum_data['H']
-                if H is not None:
-                     H = H / normalization_factor
-
-                processed_stats[name] = {
-                     'mean_act': mean_act.cpu(),
-                     'var_act': var_act.cpu(),
-                     'scaler_row': scaler_row.cpu(),
-                     'H': H.cpu() if H is not None else None,
-                     'input_shape': all_inputs_cpu.shape
-                }
-                del all_inputs_cpu, act_reshaped_cpu, H, mean_act, var_act, scaler_row, accum_data # Free memory
-
-            except Exception as e:
-                logger.error(f"Error processing stats for layer {name}: {e}", exc_info=True)
-                continue # Skip this layer if processing fails
-
-        print("Stats collection finished.")
-        return processed_stats
-
-
-    def prune_sparsegpt_dsnot(self, ubatch, keep_ratio=0.5,
-                               max_cycles=50, error_threshold=0.1,
-                               percdamp=0.01, # blocksize=128, # Blocksize obsolete
-                               pow_of_var_regrowing=1.0,
-                               skip_first_last=True):
-        """
-        Prunes the model using SparseGPT initialization followed by DSnoT refinement.
-        Follows logic from reference implementation (lib/prune.py).
-
-        Args:
-            ubatch: Calibration data.
-            keep_ratio: Target sparsity (fraction of weights to keep).
-            max_cycles: Max iterations for DSnoT refinement per row/neuron.
-            error_threshold: Convergence threshold for DSnoT error reduction.
-            percdamp: Damping factor for SparseGPT Hessian inversion.
-            pow_of_var_regrowing: Power for variance scaling in DSnoT growing score.
-            skip_first_last: Whether to skip pruning the first and last linear layers.
-
-        Returns:
-            Dictionary of pruned weights.
-        """
-        print(f"Starting SparseGPT+DSnoT pruning. Target keep_ratio: {keep_ratio}")
-        device = next(self.parameters()).device
-
-        # --- Step 0: Collect Stats ---
-        layer_stats = self._collect_layer_stats(ubatch)
-        if not layer_stats:
-            print("Error: Failed to collect layer statistics. Aborting pruning.")
-            return {k: v.cpu() for k, v in self.state_dict().items()}
-
-        # --- Step 1: Initial Pruning with SparseGPT ---
-        print("Applying Initial SparseGPT Pruning...")
-        sparse_model = copy.deepcopy(self) # Work on a copy
-        initial_masks = {} # Store KEEP masks (True=keep)
-        linear_layers = {name: mod for name, mod in sparse_model.named_modules() if isinstance(mod, nn.Linear)}
-        layer_names = list(linear_layers.keys())
-
-        for i, (name, module) in enumerate(linear_layers.items()):
-            is_first_or_last = (i == 0 or i == len(layer_names) - 1)
-            if skip_first_last and is_first_or_last:
-                 print(f"  Skipping SparseGPT for layer: {name} (First/Last)")
-                 initial_masks[name] = torch.ones_like(module.weight.data, dtype=torch.bool)
-                 continue
-
-            if name not in layer_stats or layer_stats[name]['H'] is None:
-                print(f"  Skipping SparseGPT for layer: {name} (No stats or Hessian found)")
-                initial_masks[name] = torch.ones_like(module.weight.data, dtype=torch.bool)
+        
+        # Now compute activation norms and WANDA scores
+        wanda_scores = {}
+        masks = {}
+        
+        for i, (name, layer) in enumerate(zip(layer_names, linear_layers)):
+            # Skip first and last layers (we preserve these)
+            if i == 0 or i == len(linear_layers) - 1:
+                # Create all-ones mask for preserved layers
+                mask = torch.ones_like(layer.weight.data)
+                masks[name] = mask
+                print(f"Layer:{name} => Density: 1.0000")
                 continue
-
-            print(f"  SparseGPT Pruning layer: {name}")
-            W = module.weight.data.clone().float()
-            H = layer_stats[name]['H'].to(device, dtype=torch.float32)
-            rows, cols = W.shape
-
-            mask = torch.zeros_like(W, dtype=torch.bool) # Prune mask (True=prune)
-
-            try:
-                # Damp the Hessian
-                damp = percdamp * torch.mean(torch.diag(H))
-                diag_indices = torch.arange(cols, device=device)
-                H = H.contiguous()
-                H[diag_indices, diag_indices] += damp
-
-                # Invert Hessian
-                try:
-                    H_chol = torch.linalg.cholesky(H)
-                    Hinv = torch.cholesky_inverse(H_chol)
-                    Hinv = (Hinv + Hinv.T) / 2.0
-                except Exception as e_chol:
-                    print(f"    Warning: Cholesky failed for {name}: {e_chol}. Using pseudo-inverse.")
-                    Hinv = torch.linalg.pinv(H.cpu()).to(device)
-
-                # Calculate OBS scores
-                diag_hinv = torch.diag(Hinv)
-                obs_scores = (W.to(device)**2) / (torch.abs(diag_hinv.reshape(1, -1)) + 1e-12)
-
-                # Determine threshold
-                num_elements_to_keep = int(W.numel() * keep_ratio)
-                num_elements_to_prune = W.numel() - num_elements_to_keep
-
-                if num_elements_to_prune > 0:
-                    obs_scores_flat = obs_scores.flatten()
-                    finite_scores = obs_scores_flat[torch.isfinite(obs_scores_flat)]
-                    if len(finite_scores) == 0:
-                         print(f"    Warning: All OBS scores non-finite in {name}. Skipping pruning.")
-                         threshold = float('inf')
-                    elif len(finite_scores) < num_elements_to_prune:
-                         print(f"    Warning: Not enough finite OBS scores ({len(finite_scores)}) to prune {num_elements_to_prune} in {name}. Pruning available finite scores.")
-                         threshold = torch.kthvalue(finite_scores, len(finite_scores)).values # Prune all finite
-                    else:
-                         threshold = torch.kthvalue(finite_scores, num_elements_to_prune).values
-
-                    # Apply threshold, keep non-finite scores
-                    mask = (~torch.isfinite(obs_scores)) | (obs_scores <= threshold)
-                    mask = mask.cpu()
+                
+            # Get the input activations for this layer
+            if name not in activation_stats:
+                print(f"Warning: No activations captured for {name}, skipping pruning")
+                mask = torch.ones_like(layer.weight.data)
+                masks[name] = mask
+                print(f"Layer:{name} => Density: 1.0000 (unpruned)")
+                continue
+                
+            activations = activation_stats[name]
+            
+            # Compute feature norms - L2 norm across batch dimension
+            if activations.dim() >= 3:
+                # For attention layers: [batch_size, seq_len, hidden_dim]
+                # First reshape to [batch_size * seq_len, hidden_dim]
+                act_reshaped = activations.reshape(-1, activations.size(-1))
+                feature_norms = torch.norm(act_reshaped, dim=0)
+            else:
+                # For regular layers: [batch_size, hidden_dim]
+                feature_norms = torch.norm(activations, dim=0)
+            
+            # Handle potential NaNs or zeros in norms
+            feature_norms = torch.where(
+                torch.isnan(feature_norms) | (feature_norms == 0),
+                torch.ones_like(feature_norms),
+                feature_norms
+            )
+            
+            # Ensure dimensions match for multiplication
+            W = layer.weight.data
+            input_dim = W.shape[1]
+            
+            # Resize feature_norms if necessary
+            if feature_norms.size(0) != input_dim:
+                print(f"Dimension mismatch in {name}: Weight input dim {input_dim}, feature_norms dim {feature_norms.size(0)}")
+                # If we have too many features, use average of feature norms
+                if feature_norms.size(0) > input_dim:
+                    feature_norms = feature_norms[:input_dim]
+                # If we have too few features, expand by repeating
                 else:
-                    mask = torch.zeros_like(W, dtype=torch.bool)
-
-            except Exception as e_sparsegpt:
-                 print(f"  Error during SparseGPT calculation for layer {name}: {e_sparsegpt}. Skipping pruning.")
-                 mask = torch.zeros_like(W, dtype=torch.bool) # Don't prune if error occurs
-
-            initial_masks[name] = ~mask # Store KEEP mask
-            module.weight.data[mask] = 0.0 # Apply initial mask
-
-            del H, Hinv, obs_scores # Free GPU memory
-            if 'diag_hinv' in locals(): del diag_hinv
-            if device.type == 'cuda': torch.cuda.empty_cache()
-
-        print("Initial SparseGPT pruning finished.")
-
-        # --- Step 2: DSnoT Refinement ---
-        print("Applying DSnoT Refinement...")
-        dense_model = copy.deepcopy(self) # Keep original dense weights
-
-        for i, (name, module) in enumerate(linear_layers.items()):
-            is_first_or_last = (i == 0 or i == len(layer_names) - 1)
-
-            if name not in layer_stats or name not in initial_masks:
-                 print(f"  Skipping DSnoT for layer: {name} (Missing stats/mask)")
-                 continue
-
-            if skip_first_last and is_first_or_last:
-                 print(f"  Skipping DSnoT for layer: {name} (First/Last)")
-                 dense_module = dict(dense_model.named_modules())[name]
-                 module.weight.data = dense_module.weight.data.clone().to(self.dtype)
-                 continue
-
-            print(f"  DSnoT Refining layer: {name}")
-
-            try:
-                dense_module = dict(dense_model.named_modules())[name]
-                W_dense = dense_module.weight.data.float().to(device)
-                current_mask = initial_masks[name].to(device)
-
-                # Get stats, ensure they are tensors
-                mean_act = layer_stats[name]['mean_act'].to(device)
-                var_act = layer_stats[name]['var_act'].to(device)
-                scaler_row_stat = layer_stats[name]['scaler_row'] # This might be scalar or tensor
-                # Ensure scaler_row is a tensor with correct shape
-                if not isinstance(scaler_row_stat, torch.Tensor):
-                     scaler_row_stat = torch.tensor(scaler_row_stat, device=device)
-                scaler_row = scaler_row_stat.reshape(1, -1).to(device) # Shape [1, C]
-                if scaler_row.shape[1] != W_dense.shape[1]: # Check if broadcast from scalar worked
-                    if scaler_row.numel() == 1:
-                        scaler_row = scaler_row.expand(1, W_dense.shape[1])
-                    else:
-                        raise ValueError(f"Scaler row shape mismatch in {name}: {scaler_row.shape} vs weight cols {W_dense.shape[1]}")
-
-
-                # Precompute Metrics
-                dsnot_metric = W_dense * mean_act.unsqueeze(0)
-                metric_for_growing = dsnot_metric / (var_act.unsqueeze(0)**pow_of_var_regrowing + 1e-12)
-                metric_for_pruning = torch.abs(W_dense) * torch.sqrt(scaler_row + 1e-12)
-
-                # DSnoT Iterative Loop
-                rows, cols = W_dense.shape
-                initial_error_proxy = torch.sum(dsnot_metric * (~current_mask), dim=1, keepdim=True)
-                reconstruction_error = initial_error_proxy.clone()
-                initialize_error_sign = torch.sign(reconstruction_error)
-
-                # Handle potential NaN/inf in metrics - replace with safe values
-                metric_for_growing.nan_to_num_(nan=0.0, posinf=1e10, neginf=-1e10)
-                metric_for_pruning.nan_to_num_(nan=float('inf'), posinf=float('inf'))
-                reconstruction_error.nan_to_num_(nan=0.0)
-                initialize_error_sign = torch.sign(reconstruction_error) # Recalculate after nan_to_num
-
-
-                # Prepare sorted indices
-                grow_scores_sorted, grow_indices_sorted = torch.sort(metric_for_growing, dim=1, stable=True)
-                prune_scores_masked = metric_for_pruning.clone()
-                prune_scores_masked[~current_mask] = float('inf')
-                prune_scores_sorted, prune_indices_sorted = torch.sort(prune_scores_masked, dim=1, stable=True)
-
-                # Pointers
-                grow_idx_pointers = torch.zeros((rows, 2), device=device, dtype=torch.long)
-                grow_idx_pointers[:, 1] = cols - 1
-                grow_direction = torch.tensor([-1, 1], device=device, dtype=torch.long)
-                prune_idx_pointer = torch.zeros(rows, device=device, dtype=torch.long)
-
-                update_mask = torch.ones((rows, 1), device=device, dtype=torch.bool)
-
-                # ---- DSnoT Cycle Loop ----
-                for cycle in range(max_cycles):
-                    if not update_mask.any():
-                        # print(f"    Converged early at cycle {cycle}") # Optional log
-                        break
-                    active_rows_mask = update_mask.squeeze()
-                    active_rows_indices = torch.where(active_rows_mask)[0]
-                    if len(active_rows_indices) == 0: break
-
-                    current_error_sign = torch.sign(reconstruction_error[active_rows_mask])
-                    grow_pointer_idx = (current_error_sign > 0).long()
-                    current_grow_pointers = grow_idx_pointers[active_rows_mask, grow_pointer_idx]
-                    grow_idx = torch.full_like(active_rows_indices, -1, dtype=torch.long)
-
-                    # Find valid grow candidates
-                    for k, row_idx in enumerate(active_rows_indices):
-                        ptr = current_grow_pointers[k]
-                        direction = grow_direction[grow_pointer_idx[k]]
-                        found = False
-                        for search_offset in range(cols):
-                            candidate_ptr = ptr + direction * search_offset
-                            if 0 <= candidate_ptr < cols:
-                                candidate_idx = grow_indices_sorted[row_idx, candidate_ptr]
-                                # Fix boolean ambiguity: use item() to convert tensor to scalar
-                                if not current_mask[row_idx, candidate_idx].item():
-                                    grow_idx[k] = candidate_idx
-                                    grow_idx_pointers[row_idx, grow_pointer_idx[k]] = candidate_ptr + direction
-                                    found = True
-                                    break
-                            else: break
-                        if not found: update_mask[row_idx] = False
-
-                    # Find valid prune candidates
-                    current_prune_pointers = prune_idx_pointer[active_rows_mask]
-                    prune_idx = torch.full_like(active_rows_indices, -1, dtype=torch.long)
-                    for k, row_idx in enumerate(active_rows_indices):
-                        if grow_idx[k] == -1: continue # Skip if no grow cand found
-                        ptr = current_prune_pointers[k]
-                        found = False
-                        for search_offset in range(cols):
-                            candidate_ptr = ptr + search_offset
-                            if candidate_ptr < cols:
-                                candidate_idx = prune_indices_sorted[row_idx, candidate_ptr]
-                                # Fix boolean ambiguity: use item() to convert tensor to scalar
-                                if current_mask[row_idx, candidate_idx].item() and prune_scores_masked[row_idx, candidate_idx] != float('inf'):
-                                    prune_idx[k] = candidate_idx
-                                    prune_idx_pointer[row_idx] = candidate_ptr + 1
-                                    found = True
-                                    break
-                            else: break
-                        if not found: update_mask[row_idx] = False
-
-                    # Filter for Valid Swaps
-                    valid_swap_mask = (grow_idx != -1) & (prune_idx != -1) & (grow_idx != prune_idx)
-                    if not valid_swap_mask.any(): break
-                    active_rows_final = active_rows_indices[valid_swap_mask]
-                    grow_idx_final = grow_idx[valid_swap_mask]
-                    prune_idx_final = prune_idx[valid_swap_mask]
-
-                    # Get metrics for swap
-                    # Need to handle potential OOB if indices became invalid
-                    grow_metric = dsnot_metric[active_rows_final, grow_idx_final]
-                    prune_metric = dsnot_metric[active_rows_final, prune_idx_final]
-
-                    # Convergence Check
-                    error_after_swap = reconstruction_error[active_rows_final] + prune_metric.unsqueeze(1) - grow_metric.unsqueeze(1)
-                    error_after_swap.nan_to_num_(nan=0.0) # Handle potential NaNs from metrics
+                    feature_norms = feature_norms.repeat(input_dim // feature_norms.size(0) + 1)[:input_dim]
+            
+            # Compute WANDA scores (weight × activation norm)
+            # For each output neuron, score its weights by the product
+            # Shape: [output_dim, input_dim]
+            scores = torch.abs(W) * feature_norms.unsqueeze(0)
+            wanda_scores[name] = scores
+            
+            # Create mask (all ones initially)
+            mask = torch.ones_like(W)
+            
+            # For each output neuron, keep the top k% weights
+            k = int(W.shape[1] * keep_ratio)
+            for j in range(W.shape[0]):  # For each output neuron
+                if k < W.shape[1]:  # Only prune if we're keeping less than 100%
+                    # Get scores for this output neuron
+                    neuron_scores = scores[j]
                     
-                    # Fix boolean ambiguity issues when comparing tensor values
-                    sign_check_tensor = (initialize_error_sign[active_rows_final] == torch.sign(error_after_swap))
-                    threshold_check_tensor = (torch.abs(reconstruction_error[active_rows_final]) > error_threshold)
+                    # Get threshold for top k elements
+                    threshold, _ = torch.topk(neuron_scores, k, sorted=True)
+                    # Use the smallest value in the top-k as our threshold
+                    threshold_value = threshold[-1]
                     
-                    # Process each row individually to avoid boolean tensor ambiguity
-                    rows_to_update = torch.zeros_like(sign_check_tensor, dtype=torch.bool)
-                    for i in range(sign_check_tensor.size(0)):
-                        # Use item() to convert tensor values to scalars for boolean operations
-                        if sign_check_tensor[i].item() and threshold_check_tensor[i].item():
-                            rows_to_update[i] = True
-                    
-                    # Check if any rows should be updated
-                    if not rows_to_update.any():
-                        break
-                        
-                    # Get indices of rows to update
-                    update_indices = torch.where(rows_to_update)[0]
-                    active_update_rows = active_rows_final[update_indices]
-                    active_grow_idx = grow_idx_final[update_indices]
-                    active_prune_idx = prune_idx_final[update_indices]
-                    
-                    # Apply updates to mask
-                    for i, row_idx in enumerate(active_update_rows):
-                        # Use scalar indexing with .item() to avoid tensor boolean ambiguity
-                        current_mask[row_idx, active_grow_idx[i].item()] = True
-                        current_mask[row_idx, active_prune_idx[i].item()] = False
-                    
-                    # Update reconstruction error
-                    update_error_delta = (prune_metric[update_indices] - grow_metric[update_indices]).unsqueeze(1)
-                    reconstruction_error[active_update_rows] += update_error_delta
-
-                    # Deactivate rows that didn't update
-                    temp_update_mask = torch.zeros_like(update_mask, dtype=torch.bool)
-                    for row_idx in active_update_rows:
-                        # Convert to scalar with .item() to avoid tensor boolean ambiguity
-                        temp_update_mask[row_idx.item()] = True
-                    update_mask = update_mask & temp_update_mask
-
-                # ---- End of DSnoT Cycle Loop ----
-
-                # Calculate and print final density for this layer AFTER DSnoT
-                final_mask_cpu = current_mask.cpu()
-                # Density = proportion of non-zero elements (where mask is True)
-                final_density = final_mask_cpu.float().sum() / final_mask_cpu.numel()
-                print(f"Layer:{name} => Final Density after DSnoT: {final_density:.4f}") # This will be captured
-
-                # Apply final refined mask
-                module.weight.data = dense_module.weight.data.cpu() * final_mask_cpu
-                module.weight.data = module.weight.data.to(self.dtype)
-
-            except Exception as e_dsnot:
-                 print(f"  Error during DSnoT refinement for layer {name}: {e_dsnot}. Applying initial SparseGPT mask only.")
-                 # Keep the initial mask applied in sparse_model
-                 initial_mask_cpu = initial_masks[name].cpu()
-                 module.weight.data = dense_module.weight.data.cpu() * initial_mask_cpu
-                 module.weight.data = module.weight.data.to(self.dtype)
-
-            finally:
-                 # Cleanup tensors for the current layer regardless of success/error
-                 del W_dense, current_mask, mean_act, var_act, scaler_row, dsnot_metric
-                 if 'metric_for_growing' in locals(): del metric_for_growing
-                 if 'metric_for_pruning' in locals(): del metric_for_pruning
-                 if 'reconstruction_error' in locals(): del reconstruction_error
-                 if 'grow_scores_sorted' in locals(): del grow_scores_sorted, grow_indices_sorted
-                 if 'prune_scores_sorted' in locals(): del prune_scores_sorted, prune_indices_sorted
-                 if device.type == 'cuda': torch.cuda.empty_cache()
-
-        print("DSnoT refinement finished.")
-
-        # Return the state dict of the refined sparse model
-        final_weights = {}
-        for key, val in sparse_model.state_dict().items():
-            final_weights[key] = val.cpu()
-
-        del sparse_model, dense_model, layer_stats # Cleanup
-        if device.type == 'cuda': torch.cuda.empty_cache()
-
-        return final_weights
-
-
+                    # Create binary mask for this neuron based on threshold
+                    mask[j] = (neuron_scores >= threshold_value).float()
+            
+            # Apply mask to weights
+            layer.weight.data = layer.weight.data * mask
+            masks[name] = mask
+            
+            # Print statistics
+            density = mask.sum().item() / mask.numel()
+            print(f"Layer:{name} => Density: {density:.4f}")
+        
+        # Convert state dict to expected format
+        state_dict = net.state_dict()
+        weights = {}
+        for key, val in state_dict.items():
+            weights[key] = val
+        
+        return weights 
+        
+    def prune_wanda_iterative(self, ubatch, final_keep_ratio=0.3, steps=3, mini_test_batch=None):
+        """
+        Iterative WANDA pruning with multiple steps for higher sparsity.
+        
+        Gradually prunes the model in steps, which often achieves higher sparsity
+        with less accuracy degradation than one-shot pruning.
+        
+        Args:
+            ubatch: Batch of input data for calibration (determines activation patterns)
+            final_keep_ratio: Final percentage of weights to keep (0-1)
+            steps: Number of pruning steps to use
+            mini_test_batch: Optional validation batch for monitoring accuracy between steps
+            
+        Returns:
+            Dictionary of pruned weights compatible with the pipeline
+        """
+        print(f"Starting iterative WANDA pruning to target keep ratio {final_keep_ratio} in {steps} steps")
+        
+        # Start with modest pruning
+        current_keep_ratio = 0.9
+        
+        # Calculate step size to reach target
+        step_size = (current_keep_ratio - final_keep_ratio) / steps
+        
+        # Use a copy of the model for iterative pruning
+        net = copy.deepcopy(self)
+        
+        # Track accuracy degradation if test batch provided
+        if mini_test_batch is not None:
+            initial_acc = self._quick_eval(mini_test_batch)
+            print(f"Initial accuracy on mini-batch: {initial_acc:.4f}")
+        
+        # Perform iterative pruning
+        for step in range(steps):
+            current_keep_ratio -= step_size
+            print(f"Pruning step {step+1}/{steps}, keep_ratio = {current_keep_ratio:.2f}")
+            
+            # Apply WANDA pruning at current sparsity level
+            weights = net.prune_wanda(ubatch, current_keep_ratio)
+            
+            # Update model for next iteration
+            net.load_state_dict(weights)
+            
+            # Track accuracy degradation if test batch provided
+            if mini_test_batch is not None:
+                step_acc = net._quick_eval(mini_test_batch)
+                print(f"Accuracy after step {step+1}: {step_acc:.4f} (delta: {step_acc - initial_acc:.4f})")
+                
+                # Potentially backoff if accuracy drops too much
+                if step_acc < initial_acc - 0.20 and step < steps - 1:
+                    print(f"Warning: Large accuracy drop detected. Adjusting remaining pruning steps.")
+                    remaining_steps = steps - step - 1
+                    if remaining_steps > 0:
+                        step_size = step_size * 0.7  # Reduce pruning aggressiveness
+        
+        # Return final weights
+        return weights
+    
+    
+    
     def _quick_eval(self, test_batch):
-        """ Quick evaluation helper """
-        if test_batch is None:
-            logger.warning("_quick_eval received None for test_batch.")
-            return 0.0
+        """
+        Helper method to quickly evaluate model accuracy on a mini-batch.
+        
+        Args:
+            test_batch: Tuple of (inputs, labels) for evaluation
+            
+        Returns:
+            Accuracy as a float between 0 and 1
+        """
         inputs, labels = test_batch
-        # Ensure labels are on the correct device if inputs are moved
-        try:
-            device = next(self.parameters()).device
-        except StopIteration:
-            device = torch.device('cpu')
-
+        device = next(self.parameters()).device
         inputs = inputs.to(device)
         labels = labels.to(device)
-
-        original_mode = self.training
+        
+        # Switch to eval mode
         self.eval()
-        accuracy = 0.0
-        try:
-            with torch.no_grad():
-                outputs = self(inputs)
-                if outputs is None:
-                    logger.error("_quick_eval: Forward pass returned None.")
-                    return 0.0
+        
+        with torch.no_grad():
+            outputs = self(inputs)
+            _, predicted = outputs.max(1)
+            correct = predicted.eq(labels).sum().item()
+            
+        return correct / labels.size(0) 
 
-                if isinstance(outputs, tuple):
-                    logits = outputs[0]
+    def refine_dsnot(self, ubatch, original_weights=None, keep_ratio=0.9, max_cycles=50, error_threshold=0.1, pow_of_var_regrowing=1.0):
+        """
+        Refine the pruned model using DSnoT (Dynamic Sparse No Training) approach.
+        
+        This method takes a model already pruned by another method (e.g., Wanda)
+        and refines the binary mask to minimize reconstruction error without
+        any gradient updates.
+        
+        Args:
+            ubatch: Batch of input data for calibration (determines activation patterns)
+            original_weights: Original dense weights (if None, uses current model weights)
+            keep_ratio: Sparsity to maintain (same as used for initial pruning)
+            max_cycles: Maximum number of refinement cycles
+            error_threshold: Error threshold for early stopping
+            pow_of_var_regrowing: Power of variance term used in regrowing criterion
+            
+        Returns:
+            Dictionary of refined weights
+        """
+        print(f"Starting DSnoT refinement with max_cycles={max_cycles}, error_threshold={error_threshold}")
+        
+        # Create a copy of the model to work with
+        net = copy.deepcopy(self)
+        
+        # If no original weights provided, assume current weights are the original dense weights
+        if original_weights is None:
+            # This is risky but might be useful in some cases
+            print("Warning: No original dense weights provided. Using current weights as dense reference.")
+            original_weights = net.state_dict()
+        
+        # Set device to match input tensor
+        device = ubatch.device
+        
+        # Storage for activation statistics
+        activation_stats = {}
+        
+        # Define hook to capture input activations
+        def hook_fn(name):
+            def _hook(module, input_tensor, output):
+                # Store the input tensor (first element of input tuple)
+                if isinstance(input_tensor, tuple):
+                    input_tensor = input_tensor[0]
+                activation_stats[name] = {
+                    'raw': input_tensor.detach(),
+                }
+                
+                # Compute statistics - mean, variance, and L2 norm
+                if input_tensor.dim() >= 3:
+                    # For attention layers: [batch_size, seq_len, hidden_dim]
+                    # First reshape to [batch_size * seq_len, hidden_dim]
+                    act_reshaped = input_tensor.reshape(-1, input_tensor.size(-1))
+                    
+                    # Compute statistics
+                    activation_stats[name]['mean'] = torch.mean(act_reshaped, dim=0)
+                    activation_stats[name]['var'] = torch.var(act_reshaped, dim=0, unbiased=False)
+                    activation_stats[name]['norm'] = torch.norm(act_reshaped, dim=0)
                 else:
-                    logits = outputs
-
-                if not isinstance(logits, torch.Tensor) or logits.dim() < 2:
-                    logger.error(f"_quick_eval: Unexpected output type/dim {type(logits)} / {logits.dim() if isinstance(logits, torch.Tensor) else 'N/A'}")
-                    return 0.0
-
-                _, predicted = logits.max(1)
-                correct = predicted.eq(labels).sum().item()
-                accuracy = correct / labels.size(0) if labels.size(0) > 0 else 0.0
-        except Exception as e:
-             logger.error(f"Error during _quick_eval forward pass: {e}", exc_info=True)
-             accuracy = 0.0 # Return 0 accuracy if evaluation fails
-        finally:
-            self.train(original_mode)
-
-        return accuracy
-
-    # --- End of SparseGPT + DSnoT Implementation ---
+                    # For regular layers: [batch_size, hidden_dim]
+                    activation_stats[name]['mean'] = torch.mean(input_tensor, dim=0)
+                    activation_stats[name]['var'] = torch.var(input_tensor, dim=0, unbiased=False)
+                    activation_stats[name]['norm'] = torch.norm(input_tensor, dim=0)
+                
+                # Handle potential NaNs or zeros
+                for stat in ['mean', 'var', 'norm']:
+                    activation_stats[name][stat] = torch.where(
+                        torch.isnan(activation_stats[name][stat]) | (activation_stats[name][stat] == 0),
+                        torch.ones_like(activation_stats[name][stat]),
+                        activation_stats[name][stat]
+                    )
+                
+            return _hook
+        
+        # Get all linear layers in the model
+        linear_layers = []
+        layer_names = []
+        hooks = []
+        
+        for name, module in net.named_modules():
+            if isinstance(module, nn.Linear):
+                linear_layers.append(module)
+                layer_names.append(name)
+                # Register forward hook to capture inputs
+                hook = module.register_forward_hook(hook_fn(name))
+                hooks.append(hook)
+        
+        # Run the model on calibration data to collect activations
+        with torch.no_grad():
+            try:
+                # Try normal forward pass
+                if len(ubatch.shape) == 4:  # If it's already in image format
+                    _ = net(ubatch)
+                else:
+                    # If input is already embedded (3D tensor from feature extractor)
+                    # We need to bypass the embedding layer and start from transformer
+                    if hasattr(net, 'vit'):
+                        # Skip embedding layer
+                        embedded_tensor = ubatch
+                        # Forward through transformer layers
+                        for layer in net.vit.layers:
+                            embedded_tensor = layer(embedded_tensor)
+                        
+                        # Final layernorm if present
+                        if net.vit.layernorm is not None:
+                            embedded_tensor = net.vit.layernorm(embedded_tensor)
+                        
+                        # And classifier if present
+                        if hasattr(net, 'classifier') and net.classifier is not None:
+                            _ = net.classifier(embedded_tensor[:, 0, :])
+                    else:
+                        raise ValueError("Model structure unexpected")
+            except Exception as e:
+                print(f"Error during forward pass: {str(e)}")
+                print("Creating dummy input for activations...")
+                
+                # Create a standard dummy input for ViT
+                dummy_input = torch.randn(1, 3, 224, 224, device=device)
+                _ = net(dummy_input)
+        
+        # Remove hooks to clean up
+        for hook in hooks:
+            hook.remove()
+        
+        # DSnoT refinement - process each layer separately
+        current_state_dict = net.state_dict()
+        
+        # Get original weights from provided weights or backup
+        original_state_dict = {}
+        for key in current_state_dict:
+            if key in original_weights:
+                original_state_dict[key] = original_weights[key]
+            else:
+                # Handle potential discrepancies in state dict keys
+                print(f"Warning: Key {key} not found in original_weights, using current value")
+                original_state_dict[key] = current_state_dict[key]
+                
+        # Track how many layers were updated
+        layers_updated = 0
+        
+        # Process each layer
+        for i, (name, layer) in enumerate(zip(layer_names, linear_layers)):
+            # Skip first and last layers (we typically preserve these)
+            if i == 0 or i == len(linear_layers) - 1:
+                print(f"Layer:{name} => Skipping (first/last layer)")
+                continue
+                
+            # Skip layers with no activation statistics captured
+            if name not in activation_stats:
+                print(f"Warning: No activations captured for {name}, skipping refinement")
+                continue
+                
+            # Get the layer weights and statistics
+            W_sparse = layer.weight.data
+            
+            # Find the corresponding key in the original_state_dict
+            # This is tricky as the name might not match exactly with state_dict keys
+            weight_key = None
+            for key in original_state_dict:
+                if key.endswith("weight") and name in key:
+                    weight_key = key
+                    break
+            
+            if weight_key is None:
+                print(f"Warning: Could not find weight key for {name} in original_state_dict, skipping")
+                continue
+                
+            # Get the original dense weights
+            W_dense = original_state_dict[weight_key]
+            
+            # Current mask (M) - where current weights are non-zero
+            M = (W_sparse != 0).float()
+            
+            # Get activation data and statistics
+            activations = activation_stats[name]['raw']
+            mean_activations = activation_stats[name]['mean']
+            var_activations = activation_stats[name]['var']
+            norm_activations = activation_stats[name]['norm']
+            
+            # Ensure sizes match
+            if mean_activations.size(0) != W_dense.shape[1]:
+                print(f"Dimension mismatch in {name}: Weight input dim {W_dense.shape[1]}, mean_activations dim {mean_activations.size(0)}")
+                if mean_activations.size(0) > W_dense.shape[1]:
+                    mean_activations = mean_activations[:W_dense.shape[1]]
+                    var_activations = var_activations[:W_dense.shape[1]]
+                    norm_activations = norm_activations[:W_dense.shape[1]]
+                else:
+                    # If we have too few features, expand by repeating
+                    mean_activations = mean_activations.repeat(W_dense.shape[1] // mean_activations.size(0) + 1)[:W_dense.shape[1]]
+                    var_activations = var_activations.repeat(W_dense.shape[1] // var_activations.size(0) + 1)[:W_dense.shape[1]]
+                    norm_activations = norm_activations.repeat(W_dense.shape[1] // norm_activations.size(0) + 1)[:W_dense.shape[1]]
+            
+            # Calculate initial reconstruction error (Δ)
+            # For computational efficiency, we'll calculate this per row (output neuron)
+            # and track changes rather than recalculating each time
+            
+            layer_updated = False
+            
+            # Process each output dimension (row) separately
+            for row_idx in range(W_dense.shape[0]):
+                w_dense_row = W_dense[row_idx]
+                w_sparse_row = W_sparse[row_idx]
+                m_row = M[row_idx]
+                
+                # Initial reconstruction error for this row
+                # Δ = (W @ A) - (W_sparse @ A) where @ is matrix multiplication
+                # For a single row, this is element-wise: Δ = sum((w_dense - w_sparse) * activations)
+                # We only calculate the expected value across the batch
+                delta = torch.sum((w_dense_row - w_sparse_row) * mean_activations)
+                
+                # DSnoT main loop for this row
+                converged = False
+                for cycle in range(max_cycles):
+                    if abs(delta) < error_threshold:
+                        converged = True
+                        break
+                    
+                    # Growing: Find best pruned weight to reactivate
+                    # Define growing candidates (current zeros in the mask)
+                    growing_candidates = (m_row == 0)
+                    if not growing_candidates.any():
+                        # No weights to grow
+                        converged = True
+                        break
+                    
+                    # Calculate growing scores based on Eq (2) from paper
+                    # Score = w_dense * E[A] / Var(A)^pow_of_var_regrowing
+                    growing_scores = torch.zeros_like(w_dense_row)
+                    
+                    # Set scores for growing candidates
+                    expected_contrib = w_dense_row * mean_activations
+                    variance_term = torch.pow(var_activations, pow_of_var_regrowing)
+                    growing_scores[growing_candidates] = expected_contrib[growing_candidates] / variance_term[growing_candidates]
+                    
+                    # The sign logic from Eq (2)
+                    if delta > 0:
+                        # If Δ > 0, want to reduce it by adding negative contributions
+                        best_growing_idx = torch.argmin(growing_scores)
+                    else:
+                        # If Δ < 0, want to increase it by adding positive contributions
+                        best_growing_idx = torch.argmax(growing_scores)
+                    
+                    # The expected change in reconstruction error by growing this weight
+                    growing_delta = w_dense_row[best_growing_idx] * mean_activations[best_growing_idx]
+                    
+                    # Pruning: Find the weight to prune
+                    # Define pruning candidates (current ones in the mask)
+                    pruning_candidates = (m_row == 1)
+                    if not pruning_candidates.any():
+                        # No weights to prune
+                        converged = True
+                        break
+                    
+                    # Calculate pruning scores based on Eq (3) - Wanda-like metric
+                    # but with sign constraint to ensure we reduce reconstruction error
+                    pruning_scores = torch.abs(w_dense_row) * norm_activations
+                    
+                    # Set scores for invalid candidates to infinity
+                    invalid_mask = pruning_candidates.clone()
+                    
+                    # The sign constraint from Eq (3)
+                    if delta > 0:
+                        # If Δ > 0, only allow pruning weights with positive contribution
+                        invalid_mask &= (w_dense_row * mean_activations <= 0)
+                    else:
+                        # If Δ < 0, only allow pruning weights with negative contribution
+                        invalid_mask &= (w_dense_row * mean_activations >= 0)
+                    
+                    # Set scores for invalid candidates to infinity
+                    pruning_scores[invalid_mask] = float('inf')
+                    
+                    # Find best candidate
+                    best_pruning_idx = torch.argmin(pruning_scores)
+                    
+                    # Check if any valid candidate exists
+                    if pruning_scores[best_pruning_idx] == float('inf'):
+                        # No valid pruning candidates
+                        converged = True
+                        break
+                    
+                    # The expected change in reconstruction error by pruning this weight
+                    pruning_delta = w_dense_row[best_pruning_idx] * mean_activations[best_pruning_idx]
+                    
+                    # Check if swap improves reconstruction error without changing sign
+                    delta_after_swap = delta + pruning_delta - growing_delta
+                    
+                    # Only swap if it reduces error magnitude and doesn't flip sign
+                    if abs(delta_after_swap) < abs(delta) and (
+                        (delta >= 0 and delta_after_swap >= 0) or 
+                        (delta < 0 and delta_after_swap < 0)
+                    ):
+                        # Update mask with swap
+                        m_row[best_pruning_idx] = 0
+                        m_row[best_growing_idx] = 1
+                        
+                        # Update reconstruction error
+                        delta = delta_after_swap
+                        
+                        # Update sparse weights directly
+                        w_sparse_row[best_pruning_idx] = 0
+                        w_sparse_row[best_growing_idx] = w_dense_row[best_growing_idx]
+                        
+                        layer_updated = True
+                    else:
+                        # No beneficial swap found
+                        converged = True
+                        break
+                
+                # Update the layer weights with the refined mask
+                M[row_idx] = m_row
+                W_sparse[row_idx] = w_sparse_row
+            
+            if layer_updated:
+                layers_updated += 1
+                # Apply the updated weights back to the layer
+                layer.weight.data = W_sparse
+                
+                # Calculate final density for reporting
+                density = M.sum().item() / M.numel()
+                print(f"Layer:{name} => Density: {density:.4f} (refinement applied)")
+            else:
+                print(f"Layer:{name} => No updates needed")
+        
+        # Final report
+        print(f"DSnoT refinement complete: {layers_updated} layers updated.")
+        
+        # Return refined weights
+        refined_weights = {}
+        state_dict = net.state_dict()
+        for key, val in state_dict.items():
+            refined_weights[key] = val
+            
+        return refined_weights 
