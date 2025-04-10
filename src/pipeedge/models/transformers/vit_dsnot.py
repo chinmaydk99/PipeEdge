@@ -507,23 +507,29 @@ class ViTShardForImageClassification(ModuleShard):
         
         return weights 
         
-    def prune_wanda_iterative(self, ubatch, final_keep_ratio=0.3, steps=3, mini_test_batch=None):
+    def prune_dsnot_iterative(self, ubatch, final_keep_ratio=0.3, steps=3, max_cycles=50, 
+                              error_threshold=0.1, pow_of_var_regrowing=1.0, mini_test_batch=None):
         """
-        Iterative WANDA pruning with multiple steps for higher sparsity.
+        Iterative WANDA pruning with DSnoT refinement at each step for higher sparsity levels.
         
-        Gradually prunes the model in steps, which often achieves higher sparsity
-        with less accuracy degradation than one-shot pruning.
+        This approach gradually prunes the model in steps and applies DSnoT refinement after 
+        each pruning step, which often achieves higher sparsity with better accuracy than
+        one-shot pruning or standard iterative pruning.
         
         Args:
             ubatch: Batch of input data for calibration (determines activation patterns)
-            final_keep_ratio: Final percentage of weights to keep (0-1)
+            final_keep_ratio: Final target density (1-sparsity)
             steps: Number of pruning steps to use
+            max_cycles: Maximum number of DSnoT refinement cycles per step
+            error_threshold: Error threshold for early stopping in DSnoT
+            pow_of_var_regrowing: Power of variance term in DSnoT growing criterion
             mini_test_batch: Optional validation batch for monitoring accuracy between steps
             
         Returns:
             Dictionary of pruned weights compatible with the pipeline
         """
-        print(f"Starting iterative WANDA pruning to target keep ratio {final_keep_ratio} in {steps} steps")
+        print(f"Starting iterative DSnoT pruning to target keep ratio {final_keep_ratio} in {steps} steps")
+        print(f"DSnoT params: max_cycles={max_cycles}, error_threshold={error_threshold}, pow_of_var={pow_of_var_regrowing}")
         
         # Start with modest pruning
         current_keep_ratio = 0.9
@@ -534,26 +540,50 @@ class ViTShardForImageClassification(ModuleShard):
         # Use a copy of the model for iterative pruning
         net = copy.deepcopy(self)
         
+        # Store original dense weights for DSnoT refinement
+        original_weights = self.state_dict()
+        
         # Track accuracy degradation if test batch provided
         if mini_test_batch is not None:
             initial_acc = self._quick_eval(mini_test_batch)
             print(f"Initial accuracy on mini-batch: {initial_acc:.4f}")
         
-        # Perform iterative pruning
+        # Perform iterative pruning with DSnoT refinement at each step
         for step in range(steps):
             current_keep_ratio -= step_size
             print(f"Pruning step {step+1}/{steps}, keep_ratio = {current_keep_ratio:.2f}")
             
-            # Apply WANDA pruning at current sparsity level
-            weights = net.prune_wanda(ubatch, current_keep_ratio)
+            # First apply WANDA pruning at current sparsity level
+            print(f"Applying WANDA pruning (keep_ratio = {current_keep_ratio:.2f})...")
+            pruned_weights = net.prune_wanda(ubatch, current_keep_ratio)
             
-            # Update model for next iteration
-            net.load_state_dict(weights)
+            # Update model with pruned weights
+            net.load_state_dict(pruned_weights)
             
-            # Track accuracy degradation if test batch provided
+            # Check accuracy after WANDA pruning
+            if mini_test_batch is not None:
+                step_acc_wanda = net._quick_eval(mini_test_batch)
+                print(f"Accuracy after WANDA step {step+1}: {step_acc_wanda:.4f}")
+            
+            # Then apply DSnoT refinement to minimize reconstruction error
+            print(f"Applying DSnoT refinement...")
+            refined_weights = net.refine_dsnot(
+                ubatch, 
+                original_weights=original_weights,  # Always use original dense weights as reference
+                keep_ratio=current_keep_ratio,
+                max_cycles=max_cycles,
+                error_threshold=error_threshold,
+                pow_of_var_regrowing=pow_of_var_regrowing
+            )
+            
+            # Update model for next iteration with refined weights
+            net.load_state_dict(refined_weights)
+            
+            # Track accuracy after refinement
             if mini_test_batch is not None:
                 step_acc = net._quick_eval(mini_test_batch)
-                print(f"Accuracy after step {step+1}: {step_acc:.4f} (delta: {step_acc - initial_acc:.4f})")
+                print(f"Accuracy after DSnoT refinement: {step_acc:.4f} (delta from initial: {step_acc - initial_acc:.4f})")
+                print(f"DSnoT improvement over WANDA: {step_acc - step_acc_wanda:.4f}")
                 
                 # Potentially backoff if accuracy drops too much
                 if step_acc < initial_acc - 0.20 and step < steps - 1:
@@ -562,35 +592,9 @@ class ViTShardForImageClassification(ModuleShard):
                     if remaining_steps > 0:
                         step_size = step_size * 0.7  # Reduce pruning aggressiveness
         
-        # Return final weights
-        return weights
-    
-    
-    
-    def _quick_eval(self, test_batch):
-        """
-        Helper method to quickly evaluate model accuracy on a mini-batch.
-        
-        Args:
-            test_batch: Tuple of (inputs, labels) for evaluation
-            
-        Returns:
-            Accuracy as a float between 0 and 1
-        """
-        inputs, labels = test_batch
-        device = next(self.parameters()).device
-        inputs = inputs.to(device)
-        labels = labels.to(device)
-        
-        # Switch to eval mode
-        self.eval()
-        
-        with torch.no_grad():
-            outputs = self(inputs)
-            _, predicted = outputs.max(1)
-            correct = predicted.eq(labels).sum().item()
-            
-        return correct / labels.size(0) 
+        # Return final refined weights
+        print(f"Iterative DSnoT pruning complete. Final keep_ratio: {current_keep_ratio:.2f}")
+        return net.state_dict() 
 
     def refine_dsnot(self, ubatch, original_weights=None, keep_ratio=0.9, max_cycles=50, error_threshold=0.1, pow_of_var_regrowing=1.0):
         """
@@ -923,92 +927,28 @@ class ViTShardForImageClassification(ModuleShard):
             refined_weights[key] = val
             
         return refined_weights 
-        
-    def prune_dsnot_iterative(self, ubatch, final_keep_ratio=0.3, steps=3, max_cycles=50, 
-                              error_threshold=0.1, pow_of_var_regrowing=1.0, mini_test_batch=None):
+
+    def _quick_eval(self, test_batch):
         """
-        Iterative WANDA pruning with DSnoT refinement at each step for higher sparsity levels.
-        
-        This approach gradually prunes the model in steps and applies DSnoT refinement after 
-        each pruning step, which often achieves higher sparsity with better accuracy than
-        one-shot pruning or standard iterative pruning.
+        Helper method to quickly evaluate model accuracy on a mini-batch.
         
         Args:
-            ubatch: Batch of input data for calibration (determines activation patterns)
-            final_keep_ratio: Final target density (1-sparsity)
-            steps: Number of pruning steps to use
-            max_cycles: Maximum number of DSnoT refinement cycles per step
-            error_threshold: Error threshold for early stopping in DSnoT
-            pow_of_var_regrowing: Power of variance term in DSnoT growing criterion
-            mini_test_batch: Optional validation batch for monitoring accuracy between steps
+            test_batch: Tuple of (inputs, labels) for evaluation
             
         Returns:
-            Dictionary of pruned weights compatible with the pipeline
+            Accuracy as a float between 0 and 1
         """
-        print(f"Starting iterative DSnoT pruning to target keep ratio {final_keep_ratio} in {steps} steps")
-        print(f"DSnoT params: max_cycles={max_cycles}, error_threshold={error_threshold}, pow_of_var={pow_of_var_regrowing}")
+        inputs, labels = test_batch
+        device = next(self.parameters()).device
+        inputs = inputs.to(device)
+        labels = labels.to(device)
         
-        # Start with modest pruning
-        current_keep_ratio = 0.9
+        # Switch to eval mode
+        self.eval()
         
-        # Calculate step size to reach target
-        step_size = (current_keep_ratio - final_keep_ratio) / steps
-        
-        # Use a copy of the model for iterative pruning
-        net = copy.deepcopy(self)
-        
-        # Store original dense weights for DSnoT refinement
-        original_weights = self.state_dict()
-        
-        # Track accuracy degradation if test batch provided
-        if mini_test_batch is not None:
-            initial_acc = self._quick_eval(mini_test_batch)
-            print(f"Initial accuracy on mini-batch: {initial_acc:.4f}")
-        
-        # Perform iterative pruning with DSnoT refinement at each step
-        for step in range(steps):
-            current_keep_ratio -= step_size
-            print(f"Pruning step {step+1}/{steps}, keep_ratio = {current_keep_ratio:.2f}")
+        with torch.no_grad():
+            outputs = self(inputs)
+            _, predicted = outputs.max(1)
+            correct = predicted.eq(labels).sum().item()
             
-            # First apply WANDA pruning at current sparsity level
-            print(f"Applying WANDA pruning (keep_ratio = {current_keep_ratio:.2f})...")
-            pruned_weights = net.prune_wanda(ubatch, current_keep_ratio)
-            
-            # Update model with pruned weights
-            net.load_state_dict(pruned_weights)
-            
-            # Check accuracy after WANDA pruning
-            if mini_test_batch is not None:
-                step_acc_wanda = net._quick_eval(mini_test_batch)
-                print(f"Accuracy after WANDA step {step+1}: {step_acc_wanda:.4f}")
-            
-            # Then apply DSnoT refinement to minimize reconstruction error
-            print(f"Applying DSnoT refinement...")
-            refined_weights = net.refine_dsnot(
-                ubatch, 
-                original_weights=original_weights,  # Always use original dense weights as reference
-                keep_ratio=current_keep_ratio,
-                max_cycles=max_cycles,
-                error_threshold=error_threshold,
-                pow_of_var_regrowing=pow_of_var_regrowing
-            )
-            
-            # Update model for next iteration with refined weights
-            net.load_state_dict(refined_weights)
-            
-            # Track accuracy after refinement
-            if mini_test_batch is not None:
-                step_acc = net._quick_eval(mini_test_batch)
-                print(f"Accuracy after DSnoT refinement: {step_acc:.4f} (delta from initial: {step_acc - initial_acc:.4f})")
-                print(f"DSnoT improvement over WANDA: {step_acc - step_acc_wanda:.4f}")
-                
-                # Potentially backoff if accuracy drops too much
-                if step_acc < initial_acc - 0.20 and step < steps - 1:
-                    print(f"Warning: Large accuracy drop detected. Adjusting remaining pruning steps.")
-                    remaining_steps = steps - step - 1
-                    if remaining_steps > 0:
-                        step_size = step_size * 0.7  # Reduce pruning aggressiveness
-        
-        # Return final refined weights
-        print(f"Iterative DSnoT pruning complete. Final keep_ratio: {current_keep_ratio:.2f}")
-        return net.state_dict() 
+        return correct / labels.size(0) 
