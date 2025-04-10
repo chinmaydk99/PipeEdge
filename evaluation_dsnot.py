@@ -312,7 +312,11 @@ def evaluation(args, dataset_cfg):
     )
 
     # Initialize the accuracy reporter early
-    acc_reporter = EnhancedReportAccuracy(batch_size, output_dir, model_name, partition, quant[0] if quant else 0)
+    if quant is None or quant == "0":
+        quant_value = 0
+    else:
+        quant_value = quant[0] if quant else 0
+    acc_reporter = EnhancedReportAccuracy(batch_size, output_dir, model_name, partition, quant_value)
 
     if prune:
         pruned_model_file = model_cfg_dsnot._MODEL_CONFIGS[model_name]['pruned_weights_file']
@@ -528,13 +532,22 @@ def evaluation(args, dataset_cfg):
     assert len(parts) % 2 == 0
     num_shards = len(parts)//2
     stage_layers = [(parts[i], parts[i+1]) for i in range(0, len(parts), 2)]
-    stage_quant = [int(i) for i in quant.split(',')] if quant else _get_default_quant(len(stage_layers))
+    
+    # Handle quantization bits
+    if quant == "0":
+        # Special case for --quant 0 (no quantization)
+        stage_quant = _get_default_quant(len(stage_layers))
+    else:
+        stage_quant = [int(i) for i in quant.split(',')] if quant else _get_default_quant(len(stage_layers))
+        # Ensure stage_quant has enough elements
+        if len(stage_quant) < len(stage_layers):
+            stage_quant.extend([0] * (len(stage_layers) - len(stage_quant)))
 
     # model construct
     model_shards = []
-    q_bits = []
     for stage in range(num_shards):
-        q_bits = torch.tensor((0 if stage == 0 else stage_quant[stage - 1], stage_quant[stage]))
+        # Create quantization bits tensor safely
+        q_bits = torch.tensor([0 if stage == 0 else stage_quant[stage - 1], stage_quant[stage]])
         model_shards.append(_make_shard(model_name, model_file, stage_layers, stage, q_bits, prune))
         model_shards[-1].register_buffer('quant_bit', torch.tensor(stage_quant[stage]), persistent=False)
 
