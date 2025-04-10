@@ -1,14 +1,14 @@
-"""ViT Transformers with WANDA Pruning.
+"""ViT Transformers with Structured Pruning and LoRA.
 
-This module implements the WANDA (Weight-Activation Norm Data-Aware) pruning approach
-for Vision Transformers, based on the paper "A Simple and Effective Pruning Approach
-for Large Language Models" (Sun et al., ICLR 2024).
+This module implements the LLM-Pruner structured pruning and LoRA fine-tuning approach
+for Vision Transformers, based on the paper "LLM-Pruner: On the Structural Pruning of Large Language Models"
+(Ma et al., 2023).
 """
 from collections.abc import Mapping
 import logging
 import math
 import os
-from typing import Optional, Union
+from typing import Optional, Union, Dict, List, Tuple, Set
 import numpy as np
 import requests
 import torch
@@ -17,11 +17,15 @@ from transformers import ViTConfig
 from transformers.models.vit.modeling_vit import (
     ViTEmbeddings, ViTIntermediate, ViTOutput, ViTSelfAttention, ViTSelfOutput
 )
+from peft import LoraConfig, get_peft_model
 from .. import ModuleShard, ModuleShardConfig
 from . import TransformerShardData
 import torch.nn.functional as F
 import types
 import copy
+import networkx as nx
+import time
+from functools import partial
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +81,315 @@ def return_reorder_indice(input_tensor):
     reorder_indice = (positive_value + negative_value).to(torch.int64)
 
     return reorder_indice
+
+
+# LLM-Pruner Components
+
+class StructuralGroup:
+    """Represents a group of structurally dependent components that must be pruned together."""
+    
+    def __init__(self, group_id: int, group_type: str):
+        self.group_id = group_id
+        self.group_type = group_type  # 'attention', 'mlp', or 'channel'
+        self.modules = {}  # Dict mapping module names to modules
+        self.parameters = {}  # Dict mapping parameter names to parameters
+        self.importance = 0.0  # Will be set during importance estimation
+        
+    def add_module(self, name: str, module: nn.Module):
+        """Add a module to this structural group."""
+        self.modules[name] = module
+        # Also track its parameters
+        for param_name, param in module.named_parameters():
+            full_name = f"{name}.{param_name}"
+            self.parameters[full_name] = param
+            
+    def __repr__(self):
+        return f"StructuralGroup(id={self.group_id}, type={self.group_type}, " \
+               f"modules={list(self.modules.keys())}, importance={self.importance:.4f})"
+
+
+class LoRALinear(nn.Module):
+    """Linear layer with LoRA adapters for efficient fine-tuning."""
+    
+    def __init__(self, 
+                 base_layer: nn.Linear, 
+                 rank: int = 8, 
+                 alpha: float = 16.0,
+                 dropout: float = 0.0):
+        super().__init__()
+        
+        # Store the original layer
+        self.base_layer = base_layer
+        
+        # LoRA hyperparameters
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+        
+        # Input and output dimensions
+        self.in_features = base_layer.in_features
+        self.out_features = base_layer.out_features
+        
+        # LoRA low-rank matrices
+        self.lora_A = nn.Parameter(torch.zeros(rank, self.in_features))
+        self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank))
+        
+        # Dropout for regularization
+        self.dropout = nn.Dropout(dropout)
+        
+        # Initialize LoRA parameters
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+        
+    def forward(self, x):
+        # Regular forward pass
+        base_output = self.base_layer(x)
+        
+        # LoRA adaptation
+        lora_output = self.dropout(x) @ self.lora_A.t() @ self.lora_B.t() * self.scaling
+        
+        # Combined output
+        return base_output + lora_output
+
+
+def apply_lora_to_model(model, rank=8, alpha=16.0, target_modules=None):
+    """Apply LoRA adapters to specific modules in a model."""
+    
+    if target_modules is None:
+        # Default: apply to all attention QKV and output, and MLP layers
+        target_modules = ["query", "key", "value", "dense"]
+        
+    for name, module in list(model.named_modules()):
+        # Check if module is a target for LoRA adaptation
+        if any(target_name in name for target_name in target_modules) and isinstance(module, nn.Linear):
+            parent_name = name.rsplit(".", 1)[0]
+            child_name = name.split(".")[-1]
+            
+            # Get parent module
+            parent = model
+            for part in parent_name.split("."):
+                if part:
+                    parent = getattr(parent, part)
+            
+            # Replace with LoRA version
+            lora_module = LoRALinear(module, rank=rank, alpha=alpha)
+            setattr(parent, child_name, lora_module)
+            
+    return model
+
+
+def find_structural_groups(model, group_type='block'):
+    """
+    Identify structural groups in the model based on connectivity patterns.
+    
+    Args:
+        model: The ViT model
+        group_type: 'block' (attention/MLP blocks) or 'channel' (cross-layer channels)
+        
+    Returns:
+        List of StructuralGroup objects
+    """
+    groups = []
+    group_id = 0
+    
+    # Build a connectivity graph
+    G = nx.DiGraph()
+    
+    # Map all named modules and parameters
+    module_map = {}
+    param_map = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            module_map[name] = module
+            
+            # Add nodes for input and output of this layer
+            in_node = f"{name}_in"
+            out_node = f"{name}_out"
+            G.add_node(in_node, type="feature", size=module.in_features)
+            G.add_node(out_node, type="feature", size=module.out_features)
+            G.add_node(name, type="module")
+            
+            # Connect input -> module -> output
+            G.add_edge(in_node, name)
+            G.add_edge(name, out_node)
+            
+            # Track parameters
+            for param_name, param in module.named_parameters():
+                full_param_name = f"{name}.{param_name}"
+                param_map[full_param_name] = param
+                G.add_node(full_param_name, type="parameter")
+                G.add_edge(name, full_param_name)
+    
+    # Analyze the model structure to find connections between layers
+    # based on ViT architecture
+    
+    if group_type == 'block':
+        # For ViT, identify attention head groups and MLP groups
+        
+        # First, identify all transformer blocks
+        transformer_blocks = {}
+        for i in range(12):  # Assuming ViT-Base with 12 blocks
+            block_prefix = f"vit.layers.{i}"
+            
+            # Find all modules in this block
+            block_modules = {name: module for name, module in module_map.items() 
+                            if name.startswith(block_prefix)}
+            
+            # Group 1: Attention head components (QKV + output projection)
+            attn_group = StructuralGroup(group_id, 'attention')
+            group_id += 1
+            
+            # Add query, key, value projections
+            for comp in ['query', 'key', 'value']:
+                module_name = f"{block_prefix}.self_attention.{comp}"
+                if module_name in module_map:
+                    attn_group.add_module(module_name, module_map[module_name])
+            
+            # Add output projection
+            output_name = f"{block_prefix}.self_output.dense"
+            if output_name in module_map:
+                attn_group.add_module(output_name, module_map[output_name])
+            
+            groups.append(attn_group)
+            
+            # Group 2: MLP components (intermediate + output)
+            mlp_group = StructuralGroup(group_id, 'mlp')
+            group_id += 1
+            
+            # Add intermediate and output layers
+            intermediate_name = f"{block_prefix}.intermediate.dense"
+            if intermediate_name in module_map:
+                mlp_group.add_module(intermediate_name, module_map[intermediate_name])
+                
+            mlp_output_name = f"{block_prefix}.output.dense"
+            if mlp_output_name in module_map:
+                mlp_group.add_module(mlp_output_name, module_map[mlp_output_name])
+            
+            groups.append(mlp_group)
+    
+    elif group_type == 'channel':
+        # For channel-wise pruning, we group parameters across layers
+        # This is more complex and less effective according to the paper
+        pass
+    
+    return groups
+
+
+def compute_group_importance(model, groups, data, loss_fn, method='vector'):
+    """
+    Compute importance scores for structural groups using gradient information.
+    
+    Args:
+        model: The model to analyze
+        groups: List of structural groups
+        data: Calibration data batch (inputs, labels)
+        loss_fn: Loss function to use
+        method: Importance estimation method ('vector', 'element1', or 'element2')
+        
+    Returns:
+        Updated groups with importance scores
+    """
+    # Ensure model is in training mode for gradient computation
+    model.train()
+    
+    # Prepare inputs and targets
+    inputs, targets = data
+    device = next(model.parameters()).device
+    inputs = inputs.to(device)
+    targets = targets.to(device)
+    
+    # Get loss and compute gradients
+    outputs = model(inputs)
+    loss = loss_fn(outputs, targets)
+    loss.backward()
+    
+    # Now compute importance scores for each group
+    for group in groups:
+        group_score = 0.0
+        
+        for param_name, param in group.parameters.items():
+            if param.grad is None:
+                continue
+                
+            if method == 'vector':
+                # Use weight * gradient (first-order approximation)
+                param_importance = torch.sum(torch.abs(param.data * param.grad)).item()
+                
+            elif method == 'element1':
+                # Element-wise first-order approximation
+                param_importance = torch.sum(torch.abs(param.data * param.grad)).item()
+                
+            elif method == 'element2':
+                # Element-wise second-order approximation (using squared gradients)
+                param_importance = torch.sum(torch.abs(param.data) * torch.abs(param.grad)**2).item()
+            
+            # Accumulate importance (paper found sum works best)
+            group_score += param_importance
+            
+        # Store the importance score
+        group.importance = group_score
+    
+    # Reset gradients
+    model.zero_grad()
+    
+    # Return groups sorted by importance (ascending - least important first)
+    return sorted(groups, key=lambda g: g.importance)
+
+
+def prune_groups(model, groups, keep_ratio):
+    """
+    Prune the model by removing the least important structural groups.
+    
+    Args:
+        model: The model to prune
+        groups: List of structural groups sorted by importance
+        keep_ratio: Fraction of parameters to keep
+        
+    Returns:
+        Pruned model and a mask dictionary
+    """
+    # Count total parameters in pruneable groups
+    total_params = sum(sum(p.numel() for p in group.parameters.values()) for group in groups)
+    
+    # Calculate how many parameters to keep
+    params_to_keep = int(total_params * keep_ratio)
+    
+    # Start removing groups from the least important
+    kept_params = total_params
+    kept_groups = []
+    pruned_groups = []
+    
+    # Create masks dictionary
+    masks = {}
+    
+    # Initialize all masks to ones (keep everything)
+    for group in groups:
+        for param_name, param in group.parameters.items():
+            masks[param_name] = torch.ones_like(param.data)
+    
+    # Remove least important groups until we reach desired sparsity
+    for group in groups:
+        group_params = sum(p.numel() for p in group.parameters.values())
+        
+        if kept_params - group_params >= params_to_keep:
+            # We can prune this group
+            kept_params -= group_params
+            pruned_groups.append(group)
+            
+            # Update masks for this group's parameters
+            for param_name, param in group.parameters.items():
+                masks[param_name] = torch.zeros_like(param.data)
+                
+            print(f"Pruned: {group}")
+        else:
+            kept_groups.append(group)
+    
+    # Apply the masks to the model
+    for name, param in model.named_parameters():
+        if name in masks:
+            param.data *= masks[name]
+    
+    return model, masks, pruned_groups, kept_groups
 
 
 class ViTLayerShard(ModuleShard):
@@ -316,18 +629,20 @@ class ViTShardForImageClassification(ModuleShard):
         """Save the model weights file."""
         ViTModelShard.save_weights(model_name, model_file, url=url, timeout_sec=timeout_sec)
 
-    # WANDA Pruning Implementation
-    def prune_wanda(self, ubatch, keep_ratio=0.9):
+    # LLM-Pruner Structural Pruning Implementation
+    def prune_structured(self, calib_batch, keep_ratio=0.7, group_type='block', importance_method='vector'):
         """
-        Prune ViT model using WANDA (Weight-Activation Norm Data-Aware) pruning.
+        Prune ViT model using LLM-Pruner structural pruning approach.
         
-        This method implements the WANDA pruning approach from Sun et al. (ICLR 2024),
-        which prunes weights based on the product of weight magnitude and input activation
-        norm, and applies pruning on a per-output basis.
+        This method implements the structural pruning approach from Ma et al. (2023),
+        which removes entire structural components (attention heads or MLP blocks) based
+        on gradient-based importance estimation.
         
         Args:
-            ubatch: Batch of input data for calibration (determines activation patterns)
-            keep_ratio: Percentage of weights to keep (0-1)
+            calib_batch: Tuple of (inputs, labels) for calibration
+            keep_ratio: Percentage of parameters to keep (0-1)
+            group_type: Type of structural grouping to use ('block' or 'channel')
+            importance_method: Method for computing importance ('vector', 'element1', or 'element2')
         
         Returns:
             Dictionary of pruned weights compatible with the pipeline
@@ -344,160 +659,37 @@ class ViTShardForImageClassification(ModuleShard):
                 weights[key] = val
             return weights
         
-        # Print the shape of input tensor for debugging
-        print(f"Input tensor shape: {ubatch.shape}")
+        print(f"Starting structured pruning with group_type={group_type}, importance_method={importance_method}")
         
-        # Convert input tensor to right format if needed
-        # The embeddings layer expects [batch_size, channels, height, width]
-        device = ubatch.device
+        # Step 1: Discovery - Find structural groups
+        print("Step 1: Discovering structural groups...")
+        groups = find_structural_groups(net, group_type=group_type)
+        print(f"Found {len(groups)} structural groups")
         
-        # Storage for activation statistics
-        activation_stats = {}
+        # Step 2: Estimation - Compute importance scores
+        print("Step 2: Estimating group importance...")
+        # Define loss function for importance estimation
+        loss_fn = nn.CrossEntropyLoss()
         
-        # Define hook to capture input activations
-        def hook_fn(name):
-            def _hook(module, input_tensor, output):
-                # Store the input tensor (first element of input tuple)
-                if isinstance(input_tensor, tuple):
-                    input_tensor = input_tensor[0]
-                activation_stats[name] = input_tensor.detach()
-            return _hook
+        # Compute importance for each group
+        sorted_groups = compute_group_importance(net, groups, calib_batch, loss_fn, method=importance_method)
         
-        # Get all linear layers in the model
-        linear_layers = []
-        layer_names = []
-        hooks = []
+        # Print importance scores
+        print("Group importance scores (least to most important):")
+        for i, group in enumerate(sorted_groups):
+            print(f"  {i+1}. {group}")
         
-        for name, module in net.named_modules():
-            if isinstance(module, nn.Linear):
-                linear_layers.append(module)
-                layer_names.append(name)
-                # Register forward hook to capture inputs
-                hook = module.register_forward_hook(hook_fn(name))
-                hooks.append(hook)
+        # Step 3: Pruning - Remove least important groups
+        print(f"Step 3: Pruning to {keep_ratio:.2f} keep ratio...")
+        pruned_model, masks, pruned_groups, kept_groups = prune_groups(net, sorted_groups, keep_ratio)
         
-        # Run the model on calibration data to collect activations
-        with torch.no_grad():
-            try:
-                # Try normal forward pass
-                if len(ubatch.shape) == 4:  # If it's already in image format
-                    _ = net(ubatch)
-                else:
-                    # If input is already embedded (3D tensor from feature extractor)
-                    # We need to bypass the embedding layer and start from transformer
-                    if hasattr(net, 'vit'):
-                        # Skip embedding layer
-                        embedded_tensor = ubatch
-                        # Forward through transformer layers
-                        for layer in net.vit.layers:
-                            embedded_tensor = layer(embedded_tensor)
-                        
-                        # Final layernorm if present
-                        if net.vit.layernorm is not None:
-                            embedded_tensor = net.vit.layernorm(embedded_tensor)
-                        
-                        # And classifier if present
-                        if hasattr(net, 'classifier') and net.classifier is not None:
-                            _ = net.classifier(embedded_tensor[:, 0, :])
-                    else:
-                        raise ValueError("Model structure unexpected")
-            except Exception as e:
-                print(f"Error during forward pass: {str(e)}")
-                print("Creating dummy input for activations...")
-                
-                # Create a standard dummy input for ViT
-                dummy_input = torch.randn(1, 3, 224, 224, device=device)
-                _ = net(dummy_input)
+        print(f"Pruned {len(pruned_groups)} groups, kept {len(kept_groups)} groups")
         
-        # Remove hooks to clean up
-        for hook in hooks:
-            hook.remove()
-        
-        # Now compute activation norms and WANDA scores
-        wanda_scores = {}
-        masks = {}
-        
-        for i, (name, layer) in enumerate(zip(layer_names, linear_layers)):
-            # Skip first and last layers (we preserve these)
-            if i == 0 or i == len(linear_layers) - 1:
-                # Create all-ones mask for preserved layers
-                mask = torch.ones_like(layer.weight.data)
-                masks[name] = mask
-                print(f"Layer:{name} => Density: 1.0000")
-                continue
-                
-            # Get the input activations for this layer
-            if name not in activation_stats:
-                print(f"Warning: No activations captured for {name}, skipping pruning")
-                mask = torch.ones_like(layer.weight.data)
-                masks[name] = mask
-                print(f"Layer:{name} => Density: 1.0000 (unpruned)")
-                continue
-                
-            activations = activation_stats[name]
-            
-            # Compute feature norms - L2 norm across batch dimension
-            if activations.dim() >= 3:
-                # For attention layers: [batch_size, seq_len, hidden_dim]
-                # First reshape to [batch_size * seq_len, hidden_dim]
-                act_reshaped = activations.reshape(-1, activations.size(-1))
-                feature_norms = torch.norm(act_reshaped, dim=0)
-            else:
-                # For regular layers: [batch_size, hidden_dim]
-                feature_norms = torch.norm(activations, dim=0)
-            
-            # Handle potential NaNs or zeros in norms
-            feature_norms = torch.where(
-                torch.isnan(feature_norms) | (feature_norms == 0),
-                torch.ones_like(feature_norms),
-                feature_norms
-            )
-            
-            # Ensure dimensions match for multiplication
-            W = layer.weight.data
-            input_dim = W.shape[1]
-            
-            # Resize feature_norms if necessary
-            if feature_norms.size(0) != input_dim:
-                print(f"Dimension mismatch in {name}: Weight input dim {input_dim}, feature_norms dim {feature_norms.size(0)}")
-                # If we have too many features, use average of feature norms
-                if feature_norms.size(0) > input_dim:
-                    feature_norms = feature_norms[:input_dim]
-                # If we have too few features, expand by repeating
-                else:
-                    feature_norms = feature_norms.repeat(input_dim // feature_norms.size(0) + 1)[:input_dim]
-            
-            # Compute WANDA scores (weight × activation norm)
-            # For each output neuron, score its weights by the product
-            # Shape: [output_dim, input_dim]
-            scores = torch.abs(W) * feature_norms.unsqueeze(0)
-            wanda_scores[name] = scores
-            
-            # Create mask (all ones initially)
-            mask = torch.ones_like(W)
-            
-            # For each output neuron, keep the top k% weights
-            k = int(W.shape[1] * keep_ratio)
-            for j in range(W.shape[0]):  # For each output neuron
-                if k < W.shape[1]:  # Only prune if we're keeping less than 100%
-                    # Get scores for this output neuron
-                    neuron_scores = scores[j]
-                    
-                    # Get threshold for top k elements
-                    threshold, _ = torch.topk(neuron_scores, k, sorted=True)
-                    # Use the smallest value in the top-k as our threshold
-                    threshold_value = threshold[-1]
-                    
-                    # Create binary mask for this neuron based on threshold
-                    mask[j] = (neuron_scores >= threshold_value).float()
-            
-            # Apply mask to weights
-            layer.weight.data = layer.weight.data * mask
-            masks[name] = mask
-            
-            # Print statistics
-            density = mask.sum().item() / mask.numel()
-            print(f"Layer:{name} => Density: {density:.4f}")
+        # Log pruning stats
+        total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+        pruned_params = sum(sum(p.numel() for p in group.parameters.values()) for group in pruned_groups)
+        actual_sparsity = pruned_params / total_params
+        print(f"Actual sparsity achieved: {actual_sparsity:.4f} (pruned {pruned_params} of {total_params} parameters)")
         
         # Convert state dict to expected format
         state_dict = net.state_dict()
@@ -505,67 +697,182 @@ class ViTShardForImageClassification(ModuleShard):
         for key, val in state_dict.items():
             weights[key] = val
         
-        return weights 
-        
-    def prune_wanda_iterative(self, ubatch, final_keep_ratio=0.3, steps=3, mini_test_batch=None):
-        """
-        Iterative WANDA pruning with multiple steps for higher sparsity.
-        
-        Gradually prunes the model in steps, which often achieves higher sparsity
-        with less accuracy degradation than one-shot pruning.
-        
-        Args:
-            ubatch: Batch of input data for calibration (determines activation patterns)
-            final_keep_ratio: Final percentage of weights to keep (0-1)
-            steps: Number of pruning steps to use
-            mini_test_batch: Optional validation batch for monitoring accuracy between steps
-            
-        Returns:
-            Dictionary of pruned weights compatible with the pipeline
-        """
-        print(f"Starting iterative WANDA pruning to target keep ratio {final_keep_ratio} in {steps} steps")
-        
-        # Start with modest pruning
-        current_keep_ratio = 0.9
-        
-        # Calculate step size to reach target
-        step_size = (current_keep_ratio - final_keep_ratio) / steps
-        
-        # Use a copy of the model for iterative pruning
-        net = copy.deepcopy(self)
-        
-        # Track accuracy degradation if test batch provided
-        if mini_test_batch is not None:
-            initial_acc = self._quick_eval(mini_test_batch)
-            print(f"Initial accuracy on mini-batch: {initial_acc:.4f}")
-        
-        # Perform iterative pruning
-        for step in range(steps):
-            current_keep_ratio -= step_size
-            print(f"Pruning step {step+1}/{steps}, keep_ratio = {current_keep_ratio:.2f}")
-            
-            # Apply WANDA pruning at current sparsity level
-            weights = net.prune_wanda(ubatch, current_keep_ratio)
-            
-            # Update model for next iteration
-            net.load_state_dict(weights)
-            
-            # Track accuracy degradation if test batch provided
-            if mini_test_batch is not None:
-                step_acc = net._quick_eval(mini_test_batch)
-                print(f"Accuracy after step {step+1}: {step_acc:.4f} (delta: {step_acc - initial_acc:.4f})")
-                
-                # Potentially backoff if accuracy drops too much
-                if step_acc < initial_acc - 0.20 and step < steps - 1:
-                    print(f"Warning: Large accuracy drop detected. Adjusting remaining pruning steps.")
-                    remaining_steps = steps - step - 1
-                    if remaining_steps > 0:
-                        step_size = step_size * 0.7  # Reduce pruning aggressiveness
-        
-        # Return final weights
         return weights
     
+    def lora_recovery(self, pruned_weights, train_loader, num_epochs=2, rank=8, alpha=16.0, lr=2e-4, eval_batch=None):
+        """
+        Apply LoRA fine-tuning to recover accuracy after pruning.
+        
+        Args:
+            pruned_weights: Pruned model weights dictionary
+            train_loader: DataLoader with training samples
+            num_epochs: Number of training epochs
+            rank: Rank for LoRA adapters
+            alpha: Scaling factor for LoRA
+            lr: Learning rate
+            eval_batch: Optional evaluation batch for progress tracking
+            
+        Returns:
+            Dictionary of recovered weights with merged LoRA parameters
+        """
+        # Load pruned weights
+        net = copy.deepcopy(self)
+        net.load_state_dict(pruned_weights)
+        
+        # Track initial accuracy if eval batch provided
+        if eval_batch is not None:
+            initial_acc = net._quick_eval(eval_batch)
+            print(f"Initial accuracy (before LoRA): {initial_acc:.4f}")
+        
+        # Step 1: Apply LoRA adapters
+        print(f"Applying LoRA adapters (rank={rank}, alpha={alpha})...")
+        lora_model = apply_lora_to_model(net, rank=rank, alpha=alpha)
+        
+        # Step 2: Set up fine-tuning
+        # Freeze base model weights
+        for name, param in lora_model.named_parameters():
+            if 'lora_' not in name:
+                param.requires_grad = False
+                
+        # Count trainable parameters
+        lora_params = sum(p.numel() for p in lora_model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in lora_model.parameters())
+        print(f"Training {lora_params} LoRA parameters ({lora_params/total_params:.2%} of total)")
+        
+        # Set up optimizer and loss function
+        optimizer = torch.optim.AdamW(
+            [p for p in lora_model.parameters() if p.requires_grad],
+            lr=lr
+        )
+        loss_fn = nn.CrossEntropyLoss()
+        
+        # Step 3: Train LoRA adapters
+        print(f"Training LoRA adapters for {num_epochs} epochs...")
+        device = next(lora_model.parameters()).device
+        
+        # Training loop
+        lora_model.train()
+        for epoch in range(num_epochs):
+            epoch_loss = 0.0
+            correct = 0
+            total = 0
+            
+            for batch_idx, (inputs, targets) in enumerate(train_loader):
+                inputs, targets = inputs.to(device), targets.to(device)
+                
+                # Forward pass
+                outputs = lora_model(inputs)
+                loss = loss_fn(outputs, targets)
+                
+                # Backward and optimize
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                # Track statistics
+                epoch_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+                
+                # Print progress
+                if (batch_idx + 1) % 10 == 0:
+                    print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx+1}, "
+                          f"Loss: {epoch_loss/(batch_idx+1):.4f}, "
+                          f"Acc: {correct/total:.4f}")
+                    
+            # Evaluate at end of epoch if eval batch provided
+            if eval_batch is not None:
+                lora_model.eval()
+                recovery_acc = lora_model._quick_eval(eval_batch)
+                lora_model.train()
+                print(f"Epoch {epoch+1}/{num_epochs} eval accuracy: {recovery_acc:.4f} "
+                      f"(delta: {recovery_acc - initial_acc:+.4f})")
+        
+        # Step 4: Merge LoRA weights into base model
+        print("Merging LoRA weights into base model...")
+        for name, module in lora_model.named_modules():
+            if isinstance(module, LoRALinear):
+                # Compute LoRA weight update: ∆W = BA
+                delta_w = module.lora_B @ module.lora_A * module.scaling
+                
+                # Add to base weights: W' = W + ∆W
+                module.base_layer.weight.data += delta_w
+                
+                # Update the module with merged weights
+                parent_name = name.rsplit(".", 1)[0]
+                child_name = name.split(".")[-1]
+                
+                # Get parent module
+                parent = lora_model
+                for part in parent_name.split("."):
+                    if part:
+                        parent = getattr(parent, part)
+                
+                # Replace with original linear with merged weights
+                setattr(parent, child_name, module.base_layer)
+        
+        # Evaluate final model if eval batch provided
+        if eval_batch is not None:
+            lora_model.eval()
+            final_acc = lora_model._quick_eval(eval_batch)
+            print(f"Final accuracy after LoRA merging: {final_acc:.4f} "
+                  f"(delta: {final_acc - initial_acc:+.4f})")
+        
+        # Convert state dict to expected format
+        state_dict = lora_model.state_dict()
+        weights = {}
+        for key, val in state_dict.items():
+            weights[key] = val
+        
+        return weights
     
+    def prune_structured_with_lora(self, calib_batch, train_loader, keep_ratio=0.7, 
+                                   group_type='block', importance_method='vector',
+                                   lora_rank=8, lora_alpha=16.0, lora_epochs=2, lora_lr=2e-4,
+                                   eval_batch=None):
+        """
+        Combined structured pruning with LoRA recovery in one step.
+        
+        Args:
+            calib_batch: Tuple of (inputs, labels) for calibration
+            train_loader: DataLoader with training samples
+            keep_ratio: Percentage of parameters to keep (0-1)
+            group_type: Type of structural grouping to use ('block' or 'channel')
+            importance_method: Method for computing importance ('vector', 'element1', or 'element2')
+            lora_rank: Rank for LoRA adapters
+            lora_alpha: Scaling factor for LoRA
+            lora_epochs: Number of training epochs
+            lora_lr: Learning rate
+            eval_batch: Optional evaluation batch for progress tracking
+            
+        Returns:
+            Dictionary of pruned and recovered weights
+        """
+        print("=== LLM-Pruner: Structured Pruning with LoRA Recovery ===")
+        
+        # Step 1: Structural Pruning
+        print("\n[Phase 1: Structural Pruning]")
+        pruned_weights = self.prune_structured(
+            calib_batch, 
+            keep_ratio=keep_ratio,
+            group_type=group_type,
+            importance_method=importance_method
+        )
+        
+        # Step 2: LoRA Recovery
+        print("\n[Phase 2: LoRA Recovery]")
+        recovered_weights = self.lora_recovery(
+            pruned_weights,
+            train_loader,
+            num_epochs=lora_epochs,
+            rank=lora_rank, 
+            alpha=lora_alpha,
+            lr=lora_lr,
+            eval_batch=eval_batch
+        )
+        
+        return recovered_weights
     
     def _quick_eval(self, test_batch):
         """

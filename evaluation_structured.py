@@ -1,4 +1,4 @@
-""" Evaluate accuracy on ImageNet dataset of PipeEdge """
+""" Evaluate accuracy on ImageNet dataset of PipeEdge with Structured Pruning and LoRA """
 import os
 import argparse
 import time
@@ -13,7 +13,7 @@ from torchvision import transforms
 from transformers import DeiTFeatureExtractor, ViTFeatureExtractor
 from runtime import forward_hook_quant_encode, forward_pre_hook_quant_decode
 from utils.data import ViTFeatureExtractorTransforms
-import model_cfg_wanda
+import model_cfg_structured
 from evaluation_tools.evaluation_quant_test import *
 
 class EnhancedReportAccuracy():
@@ -208,7 +208,7 @@ class EnhancedReportAccuracy():
                 f.write(f"  Layer 49 (Classification): 0.000000\n")
 
 def _make_shard(model_name, model_file, stage_layers, stage, q_bits, prune):
-    shard = model_cfg_wanda.module_shard_factory(model_name, model_file, stage_layers[stage][0],
+    shard = model_cfg_structured.module_shard_factory(model_name, model_file, stage_layers[stage][0],
                                             stage_layers[stage][1], stage, prune)
     shard.register_buffer('quant_bits', q_bits)
     shard.eval()
@@ -312,7 +312,7 @@ def evaluation(args, dataset_cfg):
     acc_reporter = EnhancedReportAccuracy(batch_size, output_dir, model_name, partition, quant[0] if quant else 0)
 
     if prune:
-        pruned_model_file = model_cfg_wanda._MODEL_CONFIGS[model_name]['pruned_weights_file']
+        pruned_model_file = model_cfg_structured._MODEL_CONFIGS[model_name]['pruned_weights_file']
         # dataset_split = 'train'
         print("keep ratio : ", keep_ratio, ",      train_data size : ", train_batch_size)
         
@@ -329,12 +329,12 @@ def evaluation(args, dataset_cfg):
         
         # Get a single batch for pruning
         for ubatch, ubatch_labels in train_loader:
-            config = model_cfg_wanda.get_model_config(model_name)
-            shard_config = model_cfg_wanda.ModuleShardConfig(layer_start=1, layer_end=model_cfg_wanda.get_model_layers(model_name),
+            config = model_cfg_structured.get_model_config(model_name)
+            shard_config = model_cfg_structured.ModuleShardConfig(layer_start=1, layer_end=model_cfg_structured.get_model_layers(model_name),
                                             is_first=True, is_last=True)
-            model_file = model_cfg_wanda.get_model_default_weights_file(model_name)
+            model_file = model_cfg_structured.get_model_default_weights_file(model_name)
             
-            model = model_cfg_wanda._MODEL_CONFIGS[model_name]['shard_module'](config, shard_config, model_file)
+            model = model_cfg_structured._MODEL_CONFIGS[model_name]['shard_module'](config, shard_config, model_file)
             
             # Capture the density outputs during pruning
             output_buffer = io.StringIO()
@@ -355,19 +355,9 @@ def evaluation(args, dataset_cfg):
                         pin_memory=True
                     )
                     
-                    if prune_method == 'wanda':
-                        # One-shot WANDA pruning with calibration
-                        print(f"Using WANDA pruning with keep_ratio = {keep_ratio} followed by calibration")
-                        weights = model.prune_and_calibrate(
-                            ubatch, 
-                            calib_loader=calib_loader,
-                            keep_ratio=keep_ratio,
-                            calib_steps=calib_steps,
-                            calib_lr=calib_lr
-                        )
-                    elif prune_method == 'iterative':
-                        # Iterative WANDA pruning with calibration
-                        print(f"Using iterative WANDA pruning with final_keep_ratio = {keep_ratio}, steps = {iterative_steps} followed by calibration")
+                    if prune_method == 'structured':
+                        # Structured Pruning with LoRA recovery
+                        print(f"Using LLM-Pruner structured pruning with keep_ratio = {keep_ratio} and LoRA recovery")
                         # Get a small validation batch for accuracy tracking if available
                         mini_test_batch = None
                         try:
@@ -376,38 +366,52 @@ def evaluation(args, dataset_cfg):
                         except:
                             print("Warning: Could not get validation batch for accuracy tracking")
                         
-                        weights = model.prune_iterative_and_calibrate(
-                            ubatch, 
-                            calib_loader=calib_loader,
-                            final_keep_ratio=keep_ratio, 
-                            prune_steps=iterative_steps, 
-                            calib_steps=calib_steps,
-                            calib_lr=calib_lr,
-                            mini_test_batch=mini_test_batch
+                        # Prepare calibration batch (inputs, labels)
+                        calib_batch = (ubatch, ubatch_labels)
+                        
+                        # Apply structured pruning with LoRA recovery
+                        weights = model.prune_structured_with_lora(
+                            calib_batch,
+                            calib_loader,
+                            keep_ratio=keep_ratio,
+                            group_type=args.group_type,
+                            importance_method=args.importance_method,
+                            lora_rank=args.lora_rank,
+                            lora_alpha=args.lora_alpha,
+                            lora_epochs=calib_steps,
+                            lora_lr=calib_lr,
+                            eval_batch=mini_test_batch
                         )
-        
+                    elif prune_method == 'structured_only':
+                        # Structured Pruning only (no LoRA recovery)
+                        print(f"Using LLM-Pruner structured pruning with keep_ratio = {keep_ratio} (no LoRA recovery)")
+                        # Prepare calibration batch (inputs, labels)
+                        calib_batch = (ubatch, ubatch_labels)
+                        
+                        # Apply structured pruning
+                        weights = model.prune_structured(
+                            calib_batch,
+                            keep_ratio=keep_ratio,
+                            group_type=args.group_type,
+                            importance_method=args.importance_method
+                        )
                     else:
                         raise ValueError(f"Unknown pruning method: {prune_method}")
                 else:
                     # Original pruning methods without calibration
-                    if prune_method == 'wanda':
-                        # Original WANDA pruning
-                        print(f"Using original WANDA pruning with keep_ratio = {keep_ratio}")
-                        weights = model.prune_wanda(ubatch, keep_ratio)
-                    elif prune_method == 'iterative':
-                        # Iterative WANDA pruning
-                        print(f"Using iterative WANDA pruning with final_keep_ratio = {keep_ratio}, steps = {iterative_steps}")
-                        # Get a small validation batch for accuracy tracking if available
-                        mini_test_batch = None
-                        try:
-                            val_iter = iter(val_loader)
-                            mini_test_batch = next(val_iter)
-                        except:
-                            print("Warning: Could not get validation batch for accuracy tracking")
+                    if prune_method == 'structured':
+                        # Structured pruning without separate calibration data
+                        print(f"Using LLM-Pruner structured pruning with keep_ratio = {keep_ratio} (no LoRA)")
+                        # Prepare calibration batch (inputs, labels)
+                        calib_batch = (ubatch, ubatch_labels)
                         
-                        weights = model.prune_wanda_iterative(ubatch, final_keep_ratio=keep_ratio, 
-                                                              steps=iterative_steps, mini_test_batch=mini_test_batch)
-                
+                        # Apply structured pruning
+                        weights = model.prune_structured(
+                            calib_batch,
+                            keep_ratio=keep_ratio,
+                            group_type=args.group_type,
+                            importance_method=args.importance_method
+                        )
                     else:
                         raise ValueError(f"Unknown pruning method: {prune_method}")
             
@@ -477,7 +481,7 @@ if __name__ == "__main__":
                         help="the number of worker threads for the dataloder")
     # Model options
     parser.add_argument("-m", "--model-name", type=str, default="google/vit-base-patch16-224",
-                        choices=model_cfg_wanda.get_model_names(),
+                        choices=model_cfg_structured.get_model_names(),
                         help="the neural network model for loading")
     parser.add_argument("-M", "--model-file", type=str,
                         help="the model file, if not in working directory")
@@ -503,8 +507,8 @@ if __name__ == "__main__":
                       help="Pruning method")
     dset.add_argument("--keep-ratio", type=float, default=0.9,
                       help="Pruning keep ratio")
-    dset.add_argument("--prune-method", type=str, default="wanda", choices=["wanda", "iterative"],
-                      help="Pruning method to use (wanda, iterative)")
+    dset.add_argument("--prune-method", type=str, default="structured", choices=["structured", "structured_only"],
+                      help="Pruning method to use (structured, structured_only)")
     dset.add_argument("--iterative-steps", type=int, default=3,
                       help="Number of steps for iterative pruning")
 
@@ -513,14 +517,26 @@ if __name__ == "__main__":
     calib = parser.add_argument_group('Calibration arguments')
     calib.add_argument("--calibrate", type=bool, nargs='?', const=True, default=False,
                       help="Whether to calibrate/fine-tune the model after pruning")
-    calib.add_argument("--calib-steps", type=int, default=100,
-                      help="Number of steps for calibration")
-    calib.add_argument("--calib-lr", type=float, default=1e-5,
-                      help="Learning rate for calibration")
+    calib.add_argument("--calib-steps", type=int, default=2,
+                      help="Number of steps/epochs for LoRA fine-tuning")
+    calib.add_argument("--calib-lr", type=float, default=2e-4,
+                      help="Learning rate for LoRA fine-tuning")
     calib.add_argument("--calib-batch-size", type=int, default=32,
-                      help="Batch size for calibration")
+                      help="Batch size for LoRA fine-tuning")
     calib.add_argument("--calib-samples", type=int, default=5000,
-                      help="Number of samples to use for calibration")
+                      help="Number of samples to use for LoRA fine-tuning")
+    
+    # LoRA arguments
+    lora = parser.add_argument_group('LoRA arguments')
+    lora.add_argument("--lora-rank", type=int, default=8,
+                     help="Rank for LoRA adapters (higher = more capacity)")
+    lora.add_argument("--lora-alpha", type=float, default=16.0,
+                     help="Scaling factor for LoRA adapters")
+    lora.add_argument("--group-type", type=str, default="block", choices=["block", "channel"],
+                     help="Grouping strategy for structural pruning")
+    lora.add_argument("--importance-method", type=str, default="vector", 
+                     choices=["vector", "element1", "element2"],
+                     help="Method for computing group importance")
     
     args = parser.parse_args()
 
