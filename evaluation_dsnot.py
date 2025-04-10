@@ -394,7 +394,39 @@ def evaluation(args, dataset_cfg):
                             calib_lr=calib_lr,
                             mini_test_batch=mini_test_batch
                         )
-        
+                    elif prune_method == 'dsnot_iterative':
+                        # Iterative DSnoT pruning with calibration
+                        print(f"Using iterative DSnoT pruning with final_keep_ratio = {keep_ratio}, steps = {iterative_steps} followed by calibration")
+                        print(f"DSnoT params: cycles={dsnot_cycles}, threshold={dsnot_error_threshold}, var_power={dsnot_var_power}")
+                        
+                        # Get a small validation batch for accuracy tracking if available
+                        mini_test_batch = None
+                        try:
+                            val_iter = iter(val_loader)
+                            mini_test_batch = next(val_iter)
+                        except:
+                            print("Warning: Could not get validation batch for accuracy tracking")
+                        
+                        # First apply iterative DSnoT pruning
+                        weights = model.prune_dsnot_iterative(
+                            ubatch, 
+                            final_keep_ratio=keep_ratio, 
+                            steps=iterative_steps,
+                            max_cycles=dsnot_cycles, 
+                            error_threshold=dsnot_error_threshold,
+                            pow_of_var_regrowing=dsnot_var_power,
+                            mini_test_batch=mini_test_batch
+                        )
+                        
+                        # Then load weights and perform calibration
+                        model.load_state_dict(weights)
+                        print(f"Applying calibration with {calib_steps} steps, lr={calib_lr}...")
+                        
+                        # Create a placeholder for calibration-specific code
+                        # In a real implementation, you would need to implement this
+                        print("Note: calibration after DSnoT iterative is not fully implemented")
+                        # This would typically involve a function like:
+                        # weights = model.calibrate(calib_loader, calib_steps, calib_lr)
                     else:
                         raise ValueError(f"Unknown pruning method: {prune_method}")
                 else:
@@ -416,7 +448,29 @@ def evaluation(args, dataset_cfg):
                         
                         weights = model.prune_wanda_iterative(ubatch, final_keep_ratio=keep_ratio, 
                                                               steps=iterative_steps, mini_test_batch=mini_test_batch)
-                
+                    elif prune_method == 'dsnot_iterative':
+                        # Iterative DSnoT pruning
+                        print(f"Using iterative DSnoT pruning with final_keep_ratio = {keep_ratio}, steps = {iterative_steps}")
+                        print(f"DSnoT params: cycles={dsnot_cycles}, threshold={dsnot_error_threshold}, var_power={dsnot_var_power}")
+                        
+                        # Get a small validation batch for accuracy tracking if available
+                        mini_test_batch = None
+                        try:
+                            val_iter = iter(val_loader)
+                            mini_test_batch = next(val_iter)
+                        except:
+                            print("Warning: Could not get validation batch for accuracy tracking")
+                        
+                        # Apply iterative DSnoT pruning
+                        weights = model.prune_dsnot_iterative(
+                            ubatch, 
+                            final_keep_ratio=keep_ratio, 
+                            steps=iterative_steps,
+                            max_cycles=dsnot_cycles, 
+                            error_threshold=dsnot_error_threshold,
+                            pow_of_var_regrowing=dsnot_var_power,
+                            mini_test_batch=mini_test_batch
+                        )
                     else:
                         raise ValueError(f"Unknown pruning method: {prune_method}")
             
@@ -550,8 +604,8 @@ if __name__ == "__main__":
                       help="Pruning method")
     dset.add_argument("--keep-ratio", type=float, default=0.9,
                       help="Pruning keep ratio")
-    dset.add_argument("--prune-method", type=str, default="wanda", choices=["wanda", "iterative"],
-                      help="Pruning method to use (wanda, iterative)")
+    dset.add_argument("--prune-method", type=str, default="wanda", choices=["wanda", "iterative", "dsnot_iterative"],
+                      help="Pruning method to use (wanda, iterative, dsnot_iterative)")
     dset.add_argument("--iterative-steps", type=int, default=3,
                       help="Number of steps for iterative pruning")
 
