@@ -19,6 +19,7 @@ setup(
         "PyYAML",
         "requests",
         "scipy",
+        "peft>=0.3.0",
         "timm>=0.3.2",
         "torch>=1.8.0",
         "transformers>=4.6.0",
