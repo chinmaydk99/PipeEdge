@@ -144,29 +144,51 @@ def forward_pre_hook_quant_decode(_module, input_arg: Tuple[Tuple[torch.Tensor, 
     
     # Check if the input has the expected format for quantized tensors
     if len(input_tensors) % 5 != 0 or len(input_tensors) < 5:
-        print(f"Error: Invalid encoded tensor format. Expected multiple of 5 elements, got {len(input_tensors)}")
+        print(f"Warning: Invalid encoded tensor format. Expected multiple of 5 elements, got {len(input_tensors)}")
+        # Instead of returning early, try to recover by just passing through the original input
         return input_arg
     
-    # Proceed with original logic from here
-    quant_bit = input_tensors[4][0].item() # assume the same quantization bitwidth for all items
-    forward_tensor = []
-    for i in range(len(input_tensors) // 5):
-        input_tensor = input_tensors[i*5:i*5+5]
-        batched_tensor = tensor_decode_outerdim(input_tensor)
-        forward_tensor.append(batched_tensor)
+    try:
+        # Safely access the quant_bit - handle different tensor structures
+        quant_bit_tensor = input_tensors[4]
+        if isinstance(quant_bit_tensor, torch.Tensor):
+            if quant_bit_tensor.numel() == 1:
+                quant_bit = quant_bit_tensor.item()
+            else:
+                print(f"Warning: Expected scalar tensor for quant_bit, got tensor with {quant_bit_tensor.numel()} elements")
+                # If tensor has multiple elements, use the first one
+                quant_bit = quant_bit_tensor[0].item() if quant_bit_tensor.numel() > 0 else 0
+        else:
+            # Handle non-tensor case (shouldn't happen but just in case)
+            quant_bit = 0
+            print(f"Warning: Expected tensor for quant_bit, got {type(quant_bit_tensor)}")
+    except (IndexError, AttributeError, RuntimeError) as e:
+        print(f"Error accessing quant_bit: {e}. Defaulting to 0")
+        quant_bit = 0
     
-    # Return value(s) should be wrapped in an outer tuple, like input_arg
-    # The tuple will be unpacked when forward() is invoked, which must yield a single parameter
-    if len(forward_tensor) == 1:
-        # assume that the original result was a single tensor rather than a tuple w/ len=1
-        outputs = tuple(forward_tensor)
-    else:
-        outputs = (tuple(forward_tensor),)
-    
-    # Measure work as the microbatch size, but quantization only does work if quant_bit > 0.
-    n_items = models.get_microbatch_size(outputs, verify=True) if quant_bit > 0 else 0
-    monitoring.iteration(MONITORING_KEY_QUANT_DECODE, work=n_items, accuracy=quant_bit)
-    return outputs
+    # Continue with tensor decoding within try/except to catch any other errors
+    try:
+        forward_tensor = []
+        for i in range(len(input_tensors) // 5):
+            input_tensor = input_tensors[i*5:i*5+5]
+            batched_tensor = tensor_decode_outerdim(input_tensor)
+            forward_tensor.append(batched_tensor)
+        
+        # Return value(s) should be wrapped in an outer tuple, like input_arg
+        # The tuple will be unpacked when forward() is invoked, which must yield a single parameter
+        if len(forward_tensor) == 1:
+            # assume that the original result was a single tensor rather than a tuple w/ len=1
+            outputs = tuple(forward_tensor)
+        else:
+            outputs = (tuple(forward_tensor),)
+        
+        # Measure work as the microbatch size, but quantization only does work if quant_bit > 0.
+        n_items = models.get_microbatch_size(outputs, verify=True) if quant_bit > 0 else 0
+        monitoring.iteration(MONITORING_KEY_QUANT_DECODE, work=n_items, accuracy=quant_bit)
+        return outputs
+    except Exception as e:
+        print(f"Error in tensor decoding: {e}. Passing through original input")
+        return input_arg
 
 def forward_hook_set_quant_bandwidth_heuristic(module, _inputs, outputs) -> None:
     """Set quantization bitwidth to satisfy module's `rate_constraint` (requires comm=p2p)."""

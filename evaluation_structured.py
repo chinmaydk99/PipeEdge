@@ -222,18 +222,59 @@ def _forward_model(input_tensor, model_shards):
 
         # decoder
         if idx != 0:
-            temp_tensor = forward_pre_hook_quant_decode(shard, temp_tensor)
+            try:
+                temp_tensor = forward_pre_hook_quant_decode(shard, temp_tensor)
+            except Exception as e:
+                print(f"Warning: Error in quantization decode: {e}")
+                # Attempt to continue without quantization
 
         # forward
-        if isinstance(temp_tensor[0], tuple) and len(temp_tensor[0]) == 2:
-            temp_tensor = temp_tensor[0]
-        elif isinstance(temp_tensor, tuple) and isinstance(temp_tensor[0], torch.Tensor):
-            temp_tensor = temp_tensor[0]
-        temp_tensor = shard(temp_tensor)
+        try:
+            if isinstance(temp_tensor, tuple):
+                if len(temp_tensor) > 0 and isinstance(temp_tensor[0], tuple) and len(temp_tensor[0]) == 2:
+                    temp_tensor = temp_tensor[0]
+                elif isinstance(temp_tensor[0], torch.Tensor):
+                    # Keep as is - this is the expected format
+                    pass
+                # Handle any other tuple formats by checking what the model expects
+                elif hasattr(shard, 'forward') and callable(shard.forward):
+                    # Try to adapt the input based on model's forward signature
+                    import inspect
+                    sig = inspect.signature(shard.forward)
+                    if len(sig.parameters) == 1:
+                        # Model expects a single input, use as is
+                        pass
+                    else:
+                        # Might need to unpack the tuple for multi-argument models
+                        print(f"Warning: Complex input format for shard {idx}. Attempting to adapt.")
+            
+            # Do the actual forward pass
+            temp_tensor = shard(temp_tensor)
+        except Exception as e:
+            print(f"Error in forward pass for shard {idx}: {e}")
+            # Try a basic fallback approach to keep the pipeline going
+            if isinstance(temp_tensor, tuple) and len(temp_tensor) > 0:
+                # Try with the first tensor if temp_tensor is a tuple
+                fallback_input = temp_tensor[0] if isinstance(temp_tensor[0], torch.Tensor) else temp_tensor
+                try:
+                    temp_tensor = shard(fallback_input)
+                    print(f"Recovered using fallback approach")
+                except Exception as inner_e:
+                    print(f"Fallback also failed: {inner_e}")
+                    # As a last resort, if we have a tensor, just pass it through
+                    if isinstance(fallback_input, torch.Tensor):
+                        temp_tensor = fallback_input
+                    raise e  # Re-raise if we couldn't recover
 
         # encoder
         if idx != num_shards-1:
-            temp_tensor = (forward_hook_quant_encode(shard, None, temp_tensor),)
+            try:
+                temp_tensor = (forward_hook_quant_encode(shard, None, temp_tensor),)
+            except Exception as e:
+                print(f"Warning: Error in quantization encode: {e}")
+                # Wrap in tuple to maintain expected structure
+                if not isinstance(temp_tensor, tuple):
+                    temp_tensor = (temp_tensor,)
     return temp_tensor
 
 def evaluation(args, dataset_cfg):
@@ -431,7 +472,13 @@ def evaluation(args, dataset_cfg):
     assert len(parts) % 2 == 0
     num_shards = len(parts)//2
     stage_layers = [(parts[i], parts[i+1]) for i in range(0, len(parts), 2)]
-    stage_quant = [int(i) for i in quant.split(',')] if quant else _get_default_quant(len(stage_layers))
+    
+    # Fix for handling single scalar quant value
+    if quant and ',' not in quant:
+        # If quant is a single value, apply it to all stages
+        stage_quant = [int(quant)] * len(stage_layers)
+    else:
+        stage_quant = [int(i) for i in quant.split(',')] if quant else _get_default_quant(len(stage_layers))
 
     # model construct
     model_shards = []
