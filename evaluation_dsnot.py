@@ -212,6 +212,8 @@ def _make_shard(model_name, model_file, stage_layers, stage, q_bits, prune):
     shard = model_cfg_dsnot.module_shard_factory(model_name, model_file, stage_layers[stage][0],
                                             stage_layers[stage][1], stage, prune)
     shard.register_buffer('quant_bits', q_bits)
+    # Also register quant_bit (singular) for compatibility with runtime.py
+    shard.register_buffer('quant_bit', torch.tensor(q_bits[1]), persistent=False)
     shard.eval()
     return shard
 

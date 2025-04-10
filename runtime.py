@@ -90,7 +90,31 @@ def forward_hook_quant_encode(module, _input_arg, output: Union[torch.Tensor, Tu
     if isinstance(output, torch.Tensor):
         output = (output,)
     assert isinstance(output, tuple)
-    quant_bit = module.quant_bits.item()
+    
+    # Handle various attribute possibilities with better error handling
+    quant_bit = 0  # Default if all checks fail
+    
+    # First try quant_bit attribute (most common case)
+    if hasattr(module, 'quant_bit'):
+        if isinstance(module.quant_bit, torch.Tensor):
+            quant_bit = module.quant_bit.item()
+        else:
+            quant_bit = module.quant_bit
+    # Then try quant_bits attribute (fallback case)
+    elif hasattr(module, 'quant_bits'):
+        try:
+            if isinstance(module.quant_bits, torch.Tensor):
+                if module.quant_bits.numel() > 1:
+                    # For multi-element tensor, use second element for output quantization
+                    quant_bit = module.quant_bits[1].item()
+                else:
+                    quant_bit = module.quant_bits.item()
+            else:
+                quant_bit = module.quant_bits
+        except (IndexError, AttributeError, RuntimeError) as e:
+            print(f"Warning: Error accessing quant_bits: {e}. Defaulting to 0")
+            quant_bit = 0
+    
     comm_tuple = []
     for tensor in output:
         assert isinstance(tensor, torch.Tensor)
@@ -107,66 +131,67 @@ def forward_hook_quant_encode(module, _input_arg, output: Union[torch.Tensor, Tu
 def forward_pre_hook_quant_decode(_module, input_arg: Tuple[Tuple[torch.Tensor, ...]]):
     """decode tensor in the preforward hook (before each module)"""
     monitoring.iteration_start(MONITORING_KEY_QUANT_DECODE)
-    assert isinstance(input_arg, tuple)
     
-    # Make the function more robust to different input formats
-    # If the tuple doesn't have exactly one element, try to handle differently
-    if len(input_arg) != 1:
-        print(f"Warning: Expected input_arg with 1 element, got {len(input_arg)}. Attempting to recover...")
-        # If it's empty, we can't do anything
-        if len(input_arg) == 0:
-            print("Error: Empty input_arg tuple")
-            return input_arg
-        
-        # Try to find tuple elements that look like encoded tensors
-        input_tensors = None
+    # Ensure input_arg is a tuple
+    if not isinstance(input_arg, tuple):
+        print(f"Error: Expected input_arg to be tuple, got {type(input_arg)}")
+        return input_arg
+    
+    # Handle empty input
+    if len(input_arg) == 0:
+        print("Error: Empty input_arg tuple")
+        return input_arg
+    
+    # Extract the encoded tensors
+    input_tensors = None
+    
+    # Normal case: input_arg is a tuple with one element
+    if len(input_arg) == 1:
+        input_tensors = input_arg[0]
+    # Abnormal case: try to find suitable tensor structure
+    else:
+        # Look for tuple elements that match the encoding pattern (multiple of 5)
         for item in input_arg:
-            if isinstance(item, tuple) and len(item) % 5 == 0 and len(item) >= 5:
+            if isinstance(item, tuple) and len(item) >= 5 and len(item) % 5 == 0:
                 input_tensors = item
                 break
         
-        # If we couldn't find a valid encoded tensor structure, use the first element and hope
+        # If no valid structure found, use the first element as a fallback
         if input_tensors is None:
             print("Warning: Could not find valid encoded tensor structure, using first element")
             input_tensors = input_arg[0] if isinstance(input_arg[0], tuple) else input_arg
-    else:
-        # Original code path for correctly formatted input
-        input_tensors = input_arg[0]
     
     # Ensure input_tensors is a tuple
     if not isinstance(input_tensors, tuple):
         print(f"Error: Expected input_tensors to be tuple, got {type(input_tensors)}")
-        # Try to wrap it if possible
         if isinstance(input_tensors, torch.Tensor):
             input_tensors = (input_tensors,)
         else:
-            return input_arg  # Return original to avoid further errors
+            return input_arg
     
-    # Check if the input has the expected format for quantized tensors
-    if len(input_tensors) % 5 != 0 or len(input_tensors) < 5:
+    # Validate the encoded format
+    if len(input_tensors) < 5 or len(input_tensors) % 5 != 0:
         print(f"Warning: Invalid encoded tensor format. Expected multiple of 5 elements, got {len(input_tensors)}")
-        # Instead of returning early, try to recover by just passing through the original input
         return input_arg
     
+    # Extract quant_bit safely
     try:
-        # Safely access the quant_bit - handle different tensor structures
         quant_bit_tensor = input_tensors[4]
+        quant_bit = 0
+        
         if isinstance(quant_bit_tensor, torch.Tensor):
             if quant_bit_tensor.numel() == 1:
                 quant_bit = quant_bit_tensor.item()
             else:
                 print(f"Warning: Expected scalar tensor for quant_bit, got tensor with {quant_bit_tensor.numel()} elements")
-                # If tensor has multiple elements, use the first one
                 quant_bit = quant_bit_tensor[0].item() if quant_bit_tensor.numel() > 0 else 0
         else:
-            # Handle non-tensor case (shouldn't happen but just in case)
-            quant_bit = 0
-            print(f"Warning: Expected tensor for quant_bit, got {type(quant_bit_tensor)}")
-    except (IndexError, AttributeError, RuntimeError) as e:
+            quant_bit = quant_bit_tensor
+    except (IndexError, AttributeError, TypeError, RuntimeError) as e:
         print(f"Error accessing quant_bit: {e}. Defaulting to 0")
         quant_bit = 0
     
-    # Continue with tensor decoding within try/except to catch any other errors
+    # Decode the tensors
     try:
         forward_tensor = []
         for i in range(len(input_tensors) // 5):
@@ -174,15 +199,13 @@ def forward_pre_hook_quant_decode(_module, input_arg: Tuple[Tuple[torch.Tensor, 
             batched_tensor = tensor_decode_outerdim(input_tensor)
             forward_tensor.append(batched_tensor)
         
-        # Return value(s) should be wrapped in an outer tuple, like input_arg
-        # The tuple will be unpacked when forward() is invoked, which must yield a single parameter
+        # Format output based on the number of tensors
         if len(forward_tensor) == 1:
-            # assume that the original result was a single tensor rather than a tuple w/ len=1
-            outputs = tuple(forward_tensor)
+            outputs = tuple(forward_tensor)  # Single tensor case
         else:
-            outputs = (tuple(forward_tensor),)
+            outputs = (tuple(forward_tensor),)  # Multiple tensors case
         
-        # Measure work as the microbatch size, but quantization only does work if quant_bit > 0.
+        # Measure work as the microbatch size
         n_items = models.get_microbatch_size(outputs, verify=True) if quant_bit > 0 else 0
         monitoring.iteration(MONITORING_KEY_QUANT_DECODE, work=n_items, accuracy=quant_bit)
         return outputs
