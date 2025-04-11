@@ -256,8 +256,6 @@ def evaluation(args, dataset_cfg):
     keep_ratio = args.keep_ratio
     prune_method = args.prune_method
     iterative_steps = args.iterative_steps
-    max_cycles = args.max_cycles
-    error_threshold = args.error_threshold
     calibrate = args.calibrate
     calib_steps = args.calib_steps
     calib_lr = args.calib_lr
