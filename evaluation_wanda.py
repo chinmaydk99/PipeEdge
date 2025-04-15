@@ -548,6 +548,10 @@ if __name__ == "__main__":
                       help="Pruning method to use (wanda, iterative)")
     dset.add_argument("--iterative-steps", type=int, default=3,
                       help="Number of steps for iterative pruning")
+    dset.add_argument("--max-cycles", type=int, default=10,
+                      help="Maximum number of cycles for DSnoT refinement")
+    dset.add_argument("--error-threshold", type=float, default=1e-4,
+                      help="Error threshold for DSnoT refinement")
 
                       
     # Calibration arguments

@@ -256,11 +256,20 @@ def evaluation(args, dataset_cfg):
     keep_ratio = args.keep_ratio
     prune_method = args.prune_method
     iterative_steps = args.iterative_steps
+    max_cycles = args.max_cycles
+    error_threshold = args.error_threshold
     calibrate = args.calibrate
     calib_steps = args.calib_steps
     calib_lr = args.calib_lr
     calib_batch_size = args.calib_batch_size
     calib_samples = args.calib_samples
+    
+    # LoRA recovery parameters
+    recover_with_lora = args.recover_with_lora
+    lora_rank = args.lora_rank
+    lora_alpha = args.lora_alpha
+    lora_steps = args.lora_steps
+    lora_lr = args.lora_lr
     
     # If using calibration, switch to calibration-enabled model
     if calibrate and "-calib" not in model_name:
@@ -465,9 +474,55 @@ def evaluation(args, dataset_cfg):
                 if "Layer:" in line and "Density:" in line:
                     acc_reporter.capture_sparsity(line)
 
+            # Save pruned weights
             np.savez(pruned_model_file, **weights)
-            print('Pruning successfully.')
-            model_file = pruned_model_file
+            print('Pruning successfully completed.')
+            
+            # Create calibration loader if needed for either calibration or LoRA recovery
+            if calibrate or recover_with_lora:
+                print(f"Creating calibration dataset with {calib_samples} samples...")
+                # Use a subset of training data for calibration
+                calib_indices = torch.randperm(len(train_dataset))[:calib_samples]
+                calib_dataset = torch.utils.data.Subset(train_dataset, calib_indices)
+                
+                calib_loader = DataLoader(
+                    calib_dataset,
+                    batch_size=calib_batch_size,
+                    shuffle=True,
+                    num_workers=num_workers,
+                    pin_memory=True
+                )
+                
+                # Now load and apply the pruned weights
+                model.load_state_dict(weights)
+            
+                # Apply LoRA recovery if requested (takes precedence over standard calibration)
+                if recover_with_lora:
+                    print(f"Applying LoRA recovery with rank={lora_rank}, alpha={lora_alpha}")
+                    recovered_weights = model.recover_with_lora(
+                        calib_loader=calib_loader,
+                        rank=lora_rank,
+                        alpha=lora_alpha,
+                        lr=lora_lr,
+                        steps=lora_steps
+                    )
+                    
+                    # Save LoRA recovered weights
+                    lora_model_file = pruned_model_file.replace('.npz', '_lora.npz')
+                    np.savez(lora_model_file, **recovered_weights)
+                    print(f"LoRA recovery completed. Saved to {lora_model_file}")
+                    
+                    # Use the LoRA recovered weights
+                    model_file = lora_model_file
+                
+                # Apply standard calibration if requested and not using LoRA
+                elif calibrate:
+                    # Calibration is handled separately in existing code
+                    model_file = pruned_model_file
+            else:
+                # Just use the pruned weights without calibration or LoRA
+                model_file = pruned_model_file
+            
             break
 
     def _get_default_quant(n_stages: int) -> List[int]:
@@ -557,8 +612,11 @@ if __name__ == "__main__":
     dset.add_argument("--iterative-steps", type=int, default=3,
                       help="Number of steps for iterative pruning")
     dset.add_argument("--dampening", type=float, default=0.01,
-                      help="Dampening factor for APT Hessian inverse calculation")
-
+                      help="Dampening factor for APT calculations")
+    dset.add_argument("--max-cycles", type=int, default=10,
+                      help="Maximum number of cycles for DSnoT refinement")
+    dset.add_argument("--error-threshold", type=float, default=1e-4,
+                      help="Error threshold for DSnoT refinement")
                       
     # Calibration arguments
     calib = parser.add_argument_group('Calibration arguments')
@@ -572,6 +630,19 @@ if __name__ == "__main__":
                       help="Batch size for calibration")
     calib.add_argument("--calib-samples", type=int, default=5000,
                       help="Number of samples to use for calibration")
+                      
+    # LoRA recovery arguments
+    lora = parser.add_argument_group('LoRA recovery arguments')
+    lora.add_argument("--recover-with-lora", type=bool, nargs='?', const=True, default=False,
+                      help="Whether to use LoRA for post-pruning recovery")
+    lora.add_argument("--lora-rank", type=int, default=8,
+                      help="Rank for LoRA adapters")
+    lora.add_argument("--lora-alpha", type=int, default=16,
+                      help="Scaling factor for LoRA updates")
+    lora.add_argument("--lora-steps", type=int, default=1000,
+                      help="Number of steps for LoRA training")
+    lora.add_argument("--lora-lr", type=float, default=1e-3,
+                      help="Learning rate for LoRA training")
     
     args = parser.parse_args()
 
