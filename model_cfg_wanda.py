@@ -29,6 +29,9 @@ _model_cfg_add('google/vit-base-patch16-224', 48, 'ViT-B_16-224.npz',
 # Add version with calibration support
 _model_cfg_add('google/vit-base-patch16-224-calib', 48, 'ViT-B_16-224.npz',
                vit_wanda.ViTShardForImageClassification, 'ViT-B_16-224_WANDA_calibrated.npz')
+# Add version with LoRA recovery support
+_model_cfg_add('google/vit-base-patch16-224-lora', 48, 'ViT-B_16-224.npz',
+               vit_wanda.ViTShardForImageClassification, 'ViT-B_16-224_WANDA_lora.npz')
 _model_cfg_add('google/vit-large-patch16-224', 96, 'ViT-L_16-224.npz',
                vit_wanda.ViTShardForImageClassification)
 # Add version with calibration support

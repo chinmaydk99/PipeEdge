@@ -340,9 +340,40 @@ def evaluation(args, dataset_cfg):
             output_buffer = io.StringIO()
             
             with redirect_stdout(output_buffer):
-                if calibrate:
-                    # Create a calibration dataset (subset of training data)
-                    print(f"Using calibration with {calib_samples} samples, {calib_steps} steps, lr={calib_lr}")
+                # Apply pruning based on selected method
+                if prune_method == 'wanda':
+                    # Original WANDA pruning
+                    print(f"Using original WANDA pruning with keep_ratio = {keep_ratio}")
+                    weights = model.prune_wanda(ubatch, keep_ratio)
+                elif prune_method == 'iterative':
+                    # Iterative WANDA pruning
+                    print(f"Using iterative WANDA pruning with final_keep_ratio = {keep_ratio}, steps = {iterative_steps}")
+                    # Get a small validation batch for accuracy tracking if available
+                    mini_test_batch = None
+                    try:
+                        val_iter = iter(val_loader)
+                        mini_test_batch = next(val_iter)
+                    except:
+                        print("Warning: Could not get validation batch for accuracy tracking")
+                    
+                    weights = model.prune_wanda_iterative(ubatch, final_keep_ratio=keep_ratio, 
+                                                         steps=iterative_steps, mini_test_batch=mini_test_batch)
+            
+                else:
+                    raise ValueError(f"Unknown pruning method: {prune_method}")
+                
+                # Save pruned weights
+                np.savez(pruned_model_file, **weights)
+                print('Pruning successfully completed.')
+                
+                # Process captured output
+                for line in output_buffer.getvalue().split('\n'):
+                    if "Layer:" in line and "Density:" in line:
+                        acc_reporter.capture_sparsity(line)
+                
+                # Create calibration loader if needed for either calibration or LoRA recovery
+                if calibrate or args.recover_with_lora:
+                    print(f"Creating calibration dataset with {calib_samples} samples...")
                     # Use a subset of training data for calibration
                     calib_indices = torch.randperm(len(train_dataset))[:calib_samples]
                     calib_dataset = torch.utils.data.Subset(train_dataset, calib_indices)
@@ -355,70 +386,80 @@ def evaluation(args, dataset_cfg):
                         pin_memory=True
                     )
                     
-                    if prune_method == 'wanda':
-                        # One-shot WANDA pruning with calibration
-                        print(f"Using WANDA pruning with keep_ratio = {keep_ratio} followed by calibration")
-                        weights = model.prune_and_calibrate(
-                            ubatch, 
-                            calib_loader=calib_loader,
-                            keep_ratio=keep_ratio,
-                            calib_steps=calib_steps,
-                            calib_lr=calib_lr
-                        )
-                    elif prune_method == 'iterative':
-                        # Iterative WANDA pruning with calibration
-                        print(f"Using iterative WANDA pruning with final_keep_ratio = {keep_ratio}, steps = {iterative_steps} followed by calibration")
-                        # Get a small validation batch for accuracy tracking if available
-                        mini_test_batch = None
-                        try:
-                            val_iter = iter(val_loader)
-                            mini_test_batch = next(val_iter)
-                        except:
-                            print("Warning: Could not get validation batch for accuracy tracking")
-                        
-                        weights = model.prune_iterative_and_calibrate(
-                            ubatch, 
-                            calib_loader=calib_loader,
-                            final_keep_ratio=keep_ratio, 
-                            prune_steps=iterative_steps, 
-                            calib_steps=calib_steps,
-                            calib_lr=calib_lr,
-                            mini_test_batch=mini_test_batch
-                        )
-        
-                    else:
-                        raise ValueError(f"Unknown pruning method: {prune_method}")
-                else:
-                    # Original pruning methods without calibration
-                    if prune_method == 'wanda':
-                        # Original WANDA pruning
-                        print(f"Using original WANDA pruning with keep_ratio = {keep_ratio}")
-                        weights = model.prune_wanda(ubatch, keep_ratio)
-                    elif prune_method == 'iterative':
-                        # Iterative WANDA pruning
-                        print(f"Using iterative WANDA pruning with final_keep_ratio = {keep_ratio}, steps = {iterative_steps}")
-                        # Get a small validation batch for accuracy tracking if available
-                        mini_test_batch = None
-                        try:
-                            val_iter = iter(val_loader)
-                            mini_test_batch = next(val_iter)
-                        except:
-                            print("Warning: Could not get validation batch for accuracy tracking")
-                        
-                        weights = model.prune_wanda_iterative(ubatch, final_keep_ratio=keep_ratio, 
-                                                              steps=iterative_steps, mini_test_batch=mini_test_batch)
+                    # Now load and apply the pruned weights
+                    model.load_state_dict(weights)
                 
-                    else:
-                        raise ValueError(f"Unknown pruning method: {prune_method}")
-            
-            # Process captured output
-            for line in output_buffer.getvalue().split('\n'):
-                if "Layer:" in line and "Density:" in line:
-                    acc_reporter.capture_sparsity(line)
-
-            np.savez(pruned_model_file, **weights)
-            print('Pruning successfully.')
-            model_file = pruned_model_file
+                    # Apply LoRA recovery if requested (takes precedence over standard calibration)
+                    if args.recover_with_lora:
+                        print(f"Applying LoRA recovery with rank={args.lora_rank}, alpha={args.lora_alpha}")
+                        recovered_weights = model.recover_with_lora(
+                            calib_loader=calib_loader,
+                            rank=args.lora_rank,
+                            alpha=args.lora_alpha,
+                            lr=args.lora_lr,
+                            steps=args.lora_steps
+                        )
+                        
+                        # Save LoRA recovered weights
+                        lora_model_file = pruned_model_file.replace('.npz', '_lora.npz')
+                        np.savez(lora_model_file, **recovered_weights)
+                        print(f"LoRA recovery completed. Saved to {lora_model_file}")
+                        
+                        # Use the LoRA recovered weights
+                        model_file = lora_model_file
+                    
+                    # Apply standard calibration if requested and not using LoRA
+                    elif calibrate:
+                        print(f"Calibrating model with {calib_steps} steps, lr={calib_lr}")
+                        
+                        # Set up optimizer and loss function
+                        optimizer = torch.optim.AdamW(model.parameters(), lr=calib_lr)
+                        criterion = torch.nn.CrossEntropyLoss()
+                        
+                        # Training loop
+                        device = next(model.parameters()).device
+                        model.train()
+                        
+                        for step in range(calib_steps):
+                            total_loss = 0
+                            num_batches = 0
+                            
+                            for batch in calib_loader:
+                                inputs, targets = batch
+                                inputs = inputs.to(device)
+                                targets = targets.to(device)
+                                
+                                # Forward pass
+                                outputs = model(inputs)
+                                loss = criterion(outputs, targets)
+                                
+                                # Backward and optimize
+                                optimizer.zero_grad()
+                                loss.backward()
+                                optimizer.step()
+                                
+                                total_loss += loss.item()
+                                num_batches += 1
+                                
+                                # Only use one batch per step for speed
+                                break
+                            
+                            if (step + 1) % 20 == 0:
+                                avg_loss = total_loss / num_batches
+                                print(f"Calibration step {step+1}/{calib_steps}, Loss: {avg_loss:.4f}")
+                        
+                        # Save calibrated weights
+                        calibrated_weights = model.state_dict()
+                        calibrated_model_file = pruned_model_file.replace('.npz', '_calibrated.npz') 
+                        np.savez(calibrated_model_file, **calibrated_weights)
+                        print(f"Calibration completed. Saved to {calibrated_model_file}")
+                        
+                        # Use the calibrated weights
+                        model_file = calibrated_model_file
+                else:
+                    # Just use the pruned weights without calibration or LoRA
+                    model_file = pruned_model_file
+                
             break
 
     def _get_default_quant(n_stages: int) -> List[int]:
@@ -521,6 +562,19 @@ if __name__ == "__main__":
                       help="Batch size for calibration")
     calib.add_argument("--calib-samples", type=int, default=5000,
                       help="Number of samples to use for calibration")
+                      
+    # LoRA recovery arguments
+    lora = parser.add_argument_group('LoRA recovery arguments')
+    lora.add_argument("--recover-with-lora", type=bool, nargs='?', const=True, default=False,
+                      help="Whether to use LoRA for post-pruning recovery")
+    lora.add_argument("--lora-rank", type=int, default=8,
+                      help="Rank for LoRA adapters")
+    lora.add_argument("--lora-alpha", type=int, default=16,
+                      help="Scaling factor for LoRA updates")
+    lora.add_argument("--lora-steps", type=int, default=1000,
+                      help="Number of steps for LoRA training")
+    lora.add_argument("--lora-lr", type=float, default=1e-3,
+                      help="Learning rate for LoRA training")
     
     args = parser.parse_args()
 
